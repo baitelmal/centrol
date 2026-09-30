@@ -19,6 +19,14 @@ Bug fix release. No new features, no config or CLI changes.
   `policy.silence` and dropped, matching how a malformed frame from
   the client was already handled.
 
+### Security
+
+- `install-centrol.sh` now verifies the downloaded binary against the
+  release's published `SHA256SUMS` before installing it, and refuses
+  to install (no `mv`, no `chmod`) on any mismatch or on an asset
+  missing from `SHA256SUMS`. Previously the script downloaded and ran
+  `chmod +x` on the binary with no integrity check at all.
+
 ## v0.1.0 — 2026-09-29
 
 First release. Centrol wraps coding agents with an accountability layer:
