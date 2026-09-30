@@ -238,14 +238,35 @@ func configProxyMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver)
 			fmt.Fprintf(out, "error: %v\n", err)
 			return
 		}
+		targetURL, targetURLSrc, err := policy.ResolveProxyTargetURL(resolver)
+		if err != nil {
+			fmt.Fprintf(out, "error: %v\n", err)
+			return
+		}
+		httpTimeout, httpTimeoutSrc, err := policy.ResolveProxyHTTPTimeoutSeconds(resolver)
+		if err != nil {
+			fmt.Fprintf(out, "error: %v\n", err)
+			return
+		}
+		httpMaxRetries, httpMaxRetriesSrc, err := policy.ResolveProxyHTTPMaxRetries(resolver)
+		if err != nil {
+			fmt.Fprintf(out, "error: %v\n", err)
+			return
+		}
 
 		fmt.Fprintln(out, "\nProxy")
 		printLockable(out, "additional_block_paths", fmt.Sprintf("%v", blockPaths), blockPathsSrc)
 		printLockable(out, "mcp_call_timeout_seconds", callTimeout, callTimeoutSrc)
 		printLockable(out, "strict_matching", strict, strictSrc)
+		printLockable(out, "target_url", targetURL, targetURLSrc)
+		printLockable(out, "http_timeout_seconds", httpTimeout, httpTimeoutSrc)
+		printLockable(out, "http_max_retries", httpMaxRetries, httpMaxRetriesSrc)
 		fmt.Fprintln(out, "  1) Add a path to additional_block_paths")
 		fmt.Fprintln(out, "  2) Edit mcp_call_timeout_seconds")
 		fmt.Fprintln(out, "  3) Toggle strict_matching")
+		fmt.Fprintln(out, "  4) Edit target_url")
+		fmt.Fprintln(out, "  5) Edit http_timeout_seconds")
+		fmt.Fprintln(out, "  6) Edit http_max_retries")
 		fmt.Fprintln(out, "  b) Back")
 		fmt.Fprint(out, "> ")
 
@@ -302,6 +323,63 @@ func configProxyMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver)
 				continue
 			}
 			fmt.Fprintf(out, "Set strict_matching = %v (%s).\n", !strict, src)
+		case "4":
+			if lockedByEnterprise(targetURLSrc) {
+				fmt.Fprintln(out, "target_url is locked by enterprise policy and cannot be edited here")
+				continue
+			}
+			fmt.Fprint(out, "New value (HTTP target URL, empty to unset): ")
+			v := readMenuLine(in)
+			src, err := resolver.WriteConfig(policy.KeyProxyTargetURL, v)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				continue
+			}
+			fmt.Fprintf(out, "Set target_url = %q (%s). Effective on the next `centrol proxy` run.\n", v, src)
+		case "5":
+			if lockedByEnterprise(httpTimeoutSrc) {
+				fmt.Fprintln(out, "http_timeout_seconds is locked by enterprise policy and cannot be edited here")
+				continue
+			}
+			fmt.Fprintf(out, "New value (seconds, floor %d): ", policy.MinHTTPTimeoutSeconds)
+			raw := readMenuLine(in)
+			v, err := strconv.Atoi(raw)
+			if err != nil {
+				fmt.Fprintf(out, "error: %q is not an integer\n", raw)
+				continue
+			}
+			if v < policy.MinHTTPTimeoutSeconds {
+				fmt.Fprintf(out, "error: http_timeout_seconds = %d is below the minimum of %d\n", v, policy.MinHTTPTimeoutSeconds)
+				continue
+			}
+			src, err := resolver.WriteConfig(policy.KeyProxyHTTPTimeoutSecs, v)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				continue
+			}
+			fmt.Fprintf(out, "Set http_timeout_seconds = %d (%s). Effective on the next `centrol proxy` run.\n", v, src)
+		case "6":
+			if lockedByEnterprise(httpMaxRetriesSrc) {
+				fmt.Fprintln(out, "http_max_retries is locked by enterprise policy and cannot be edited here")
+				continue
+			}
+			fmt.Fprintf(out, "New value (floor %d): ", policy.MinHTTPMaxRetries)
+			raw := readMenuLine(in)
+			v, err := strconv.Atoi(raw)
+			if err != nil {
+				fmt.Fprintf(out, "error: %q is not an integer\n", raw)
+				continue
+			}
+			if v < policy.MinHTTPMaxRetries {
+				fmt.Fprintf(out, "error: http_max_retries = %d is below the minimum of %d\n", v, policy.MinHTTPMaxRetries)
+				continue
+			}
+			src, err := resolver.WriteConfig(policy.KeyProxyHTTPMaxRetries, v)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				continue
+			}
+			fmt.Fprintf(out, "Set http_max_retries = %d (%s). Effective on the next `centrol proxy` run.\n", v, src)
 		default:
 			fmt.Fprintln(out, "Not a recognized option.")
 		}
@@ -494,6 +572,15 @@ func configViewEffective(out io.Writer, resolver *policy.Resolver) {
 	}
 	if v, s, err := policy.ResolveMCPCallTimeoutSeconds(resolver); err == nil {
 		printRow("proxy.mcp_call_timeout_seconds", v, s)
+	}
+	if v, s, err := policy.ResolveProxyTargetURL(resolver); err == nil {
+		printRow("proxy.target_url", v, s)
+	}
+	if v, s, err := policy.ResolveProxyHTTPTimeoutSeconds(resolver); err == nil {
+		printRow("proxy.http_timeout_seconds", v, s)
+	}
+	if v, s, err := policy.ResolveProxyHTTPMaxRetries(resolver); err == nil {
+		printRow("proxy.http_max_retries", v, s)
 	}
 	if v, s, err := policy.ResolvePromptTimeoutSeconds(resolver); err == nil {
 		printRow("gate.prompt_timeout_seconds", v, s)
