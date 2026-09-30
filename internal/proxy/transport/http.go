@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -70,9 +71,25 @@ type HTTPTarget struct {
 	Timeout time.Duration
 
 	// Client is the http.Client used for every request; defaults to a
-	// plain &http.Client{} on first use if nil. Exposed so tests (and,
-	// later, Pass 3's CLI wiring) can inject one.
+	// plain &http.Client{} on first use if nil. Exposed so tests (and
+	// Pass 3's CLI wiring) can inject one.
 	Client *http.Client
+
+	// MaxRetries bounds how many additional attempts Send makes beyond
+	// the first when a request fails. Zero (the zero value) means no
+	// retries. Pass 3 wires this from proxy.http_max_retries.
+	//
+	// A retry only ever happens for a dial failure — an error where the
+	// request was never written to the wire, so the server could not
+	// have begun processing it (connection refused, DNS failure, no
+	// route to host). That is what "idempotent only" means here: Send
+	// has no way to know whether the JSON-RPC method it's forwarding is
+	// actually idempotent, so a retry is permitted only when nothing
+	// could possibly have reached the server on the failed attempt —
+	// never for a timeout, a mid-request write failure, or any error
+	// once bytes may have left the wire, where the server may already
+	// have processed the request.
+	MaxRetries int
 
 	mu      sync.Mutex
 	ctx     context.Context
@@ -115,7 +132,34 @@ func (t *HTTPTarget) Receive() (<-chan []byte, error) {
 // 202 Accepted means "no response to forward right now," and a
 // non-2xx/non-202 status or a request-level failure (network error,
 // timeout) is returned as an error rather than silently dropped.
+//
+// Send retries sendOnce up to MaxRetries times, but only when the
+// failure was a dial failure — see MaxRetries's doc comment for why
+// that's the only case a retry is safe here.
 func (t *HTTPTarget) Send(frame []byte) error {
+	for attempt := 0; ; attempt++ {
+		err := t.sendOnce(frame)
+		if err == nil {
+			return nil
+		}
+		if attempt >= t.MaxRetries || !isDialFailure(err) {
+			return err
+		}
+	}
+}
+
+// isDialFailure reports whether err reflects the request never having
+// reached the target at all — a failure to even establish the
+// connection — as opposed to a failure after the request was in
+// flight. See HTTPTarget.MaxRetries for why this is the only case
+// Send treats as safe to retry.
+func isDialFailure(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
+// sendOnce is Send's single-attempt body.
+func (t *HTTPTarget) sendOnce(frame []byte) error {
 	ctx, cancel := t.requestContext()
 	defer cancel()
 

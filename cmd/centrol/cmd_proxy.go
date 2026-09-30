@@ -9,6 +9,7 @@ import (
 
 	"github.com/scirem/centrol/internal/policy"
 	"github.com/scirem/centrol/internal/proxy"
+	"github.com/scirem/centrol/internal/proxy/transport"
 	"github.com/scirem/centrol/internal/session"
 	"github.com/scirem/centrol/internal/ui"
 )
@@ -25,6 +26,9 @@ func cmdProxy(args []string) {
 
 func cmdProxyRun(args []string) {
 	target := ""
+	targetGiven := false
+	targetURL := ""
+	targetURLGiven := false
 	observeFlag := false
 	quietFlag := false
 	verboseFlag := false
@@ -32,8 +36,16 @@ func cmdProxyRun(args []string) {
 		switch {
 		case a == "--target" && i+1 < len(args):
 			target = args[i+1]
+			targetGiven = true
 		case strings.HasPrefix(a, "--target="):
 			target = strings.TrimPrefix(a, "--target=")
+			targetGiven = true
+		case a == "--target-url" && i+1 < len(args):
+			targetURL = args[i+1]
+			targetURLGiven = true
+		case strings.HasPrefix(a, "--target-url="):
+			targetURL = strings.TrimPrefix(a, "--target-url=")
+			targetURLGiven = true
 		case a == "--observe":
 			observeFlag = true
 		case a == "--quiet":
@@ -42,16 +54,8 @@ func cmdProxyRun(args []string) {
 			verboseFlag = true
 		}
 	}
-	if target == "" {
-		fatalf("centrol proxy: usage: centrol proxy --target \"<mcp server command>\"")
-	}
-	// v0.1 argument splitting is plain whitespace — no quoting support
-	// yet. Good enough for the common `npx @pkg/name` case; a target
-	// command needing quoted arguments should be wrapped in a small
-	// shell script and pointed at that instead.
-	fields := strings.Fields(target)
-	if len(fields) == 0 {
-		fatalf("centrol proxy: empty --target command")
+	if targetGiven && targetURLGiven {
+		fatalf("centrol proxy: --target and --target-url are mutually exclusive — pick one transport")
 	}
 
 	// repoRoot is best-effort for proxy: an MCP server doesn't have to
@@ -64,6 +68,50 @@ func cmdProxyRun(args []string) {
 		}
 		fmt.Fprintf(os.Stderr, "centrol proxy: warning: not inside a git repo; scoping the contract to %s\n", root)
 	}
+	resolver := newResolver(root)
+
+	// Which transport to use: an explicit --target always means stdio
+	// and wins outright, ignoring any configured proxy.target_url
+	// entirely — that's the "--target overrides config target_url if
+	// both are set" rule, a precedence rule between a CLI flag and a
+	// config value, distinct from the mutual-exclusivity check above
+	// (which is only between the two CLI flags). Otherwise,
+	// --target-url, if given, or else the configured proxy.target_url,
+	// selects an HTTP target. Neither present at all is a usage error.
+	useHTTP := false
+	if !targetGiven {
+		if targetURLGiven {
+			useHTTP = true
+		} else {
+			configURL, _, cerr := policy.ResolveProxyTargetURL(resolver)
+			if cerr != nil {
+				fatalf("centrol proxy: %v", cerr)
+			}
+			if configURL != "" {
+				targetURL = configURL
+				useHTTP = true
+			}
+		}
+	}
+	if !targetGiven && !useHTTP {
+		fatalf("centrol proxy: usage: centrol proxy --target \"<mcp server command>\" or centrol proxy --target-url \"<http url>\" (or set [proxy] target_url in config)")
+	}
+
+	var fields []string
+	if !useHTTP {
+		// v0.1 argument splitting is plain whitespace — no quoting
+		// support yet. Good enough for the common `npx @pkg/name` case;
+		// a target command needing quoted arguments should be wrapped
+		// in a small shell script and pointed at that instead.
+		fields = strings.Fields(target)
+		if len(fields) == 0 {
+			fatalf("centrol proxy: empty --target command")
+		}
+	}
+	targetDesc := target
+	if useHTTP {
+		targetDesc = targetURL
+	}
 
 	g, err := openGovernorAt(root)
 	if err != nil {
@@ -71,7 +119,6 @@ func cmdProxyRun(args []string) {
 	}
 	emit := emitFunc(g)
 
-	resolver := newResolver(root)
 	logLevel := resolveLogLevel(resolver, quietFlag, verboseFlag)
 	logger := ui.NewLogger(os.Stderr, logLevel)
 
@@ -141,43 +188,53 @@ func cmdProxyRun(args []string) {
 	// Observe mode skips this entirely — no prompts, no gate — and
 	// simply proceeds, matching the same "never prompt, never block"
 	// contract as the tool-call-level policy evaluation below.
-	identity := policy.ServerIdentity(fields[0], fields[1:])
-	allowed, _, err := policy.ResolveAllowedServers(resolver)
-	if err != nil {
-		printSummaryAndClear()
-		fatalf("centrol proxy: %v", err)
-	}
-	strict, _, err := policy.ResolveStrictMatching(resolver)
-	if err != nil {
-		printSummaryAndClear()
-		fatalf("centrol proxy: %v", err)
-	}
-	if !observe && !policy.MatchesAllowlist(identity, target, allowed, strict) {
-		decision := promptServerAllowlist(identity, target)
-		switch decision {
-		case allowlistDeny:
-			fmt.Fprintf(os.Stderr, "centrol: denied — %s is not on the MCP server allowlist\n", identity)
+	//
+	// This whole pre-flight is stdio-only: it exists to vet an
+	// arbitrary local subprocess (an npx/uvx package, say) by
+	// package/binary identity before spawning it. An HTTP target is a
+	// URL the operator configured directly (--target-url or the
+	// persisted proxy.target_url) — there is no subprocess identity
+	// here for the allowlist to match against, so there is nothing for
+	// this step to do for useHTTP.
+	if !useHTTP {
+		identity := policy.ServerIdentity(fields[0], fields[1:])
+		allowed, _, err := policy.ResolveAllowedServers(resolver)
+		if err != nil {
 			printSummaryAndClear()
-			os.Exit(ui.ExitPolicyBlock)
-		case allowlistAdd:
-			src, err := resolver.WriteConfig(policy.KeyAllowedServers, append(allowed, identity))
-			if err != nil {
+			fatalf("centrol proxy: %v", err)
+		}
+		strict, _, err := policy.ResolveStrictMatching(resolver)
+		if err != nil {
+			printSummaryAndClear()
+			fatalf("centrol proxy: %v", err)
+		}
+		if !observe && !policy.MatchesAllowlist(identity, target, allowed, strict) {
+			decision := promptServerAllowlist(identity, target)
+			switch decision {
+			case allowlistDeny:
+				fmt.Fprintf(os.Stderr, "centrol: denied — %s is not on the MCP server allowlist\n", identity)
 				printSummaryAndClear()
-				fatalf("centrol proxy: adding %s to the allowlist: %v", identity, err)
+				os.Exit(ui.ExitPolicyBlock)
+			case allowlistAdd:
+				src, err := resolver.WriteConfig(policy.KeyAllowedServers, append(allowed, identity))
+				if err != nil {
+					printSummaryAndClear()
+					fatalf("centrol proxy: adding %s to the allowlist: %v", identity, err)
+				}
+				_ = emit(runID, "proxy", "policy.amend", map[string]interface{}{
+					"action": "add_to_allowlist", "server": identity, "source": src,
+				})
+				logger.Infof("centrol: added %s to the allowlist (%s)\n", identity, src)
+			case allowlistAllowOnce, allowlistAllowOnceUnattended, allowlistAllowSession:
+				_ = emit(runID, "proxy", "policy.amend", map[string]interface{}{
+					"action": "allow_server", "server": identity, "scope": decision.String(), "source": policy.SourceSessionContract,
+				})
 			}
+		} else if observe && !policy.MatchesAllowlist(identity, target, allowed, strict) {
 			_ = emit(runID, "proxy", "policy.amend", map[string]interface{}{
-				"action": "add_to_allowlist", "server": identity, "source": src,
-			})
-			logger.Infof("centrol: added %s to the allowlist (%s)\n", identity, src)
-		case allowlistAllowOnce, allowlistAllowOnceUnattended, allowlistAllowSession:
-			_ = emit(runID, "proxy", "policy.amend", map[string]interface{}{
-				"action": "allow_server", "server": identity, "scope": decision.String(), "source": policy.SourceSessionContract,
+				"action": "allow_server", "server": identity, "decision": "would_flag", "source": policy.SourceSessionContract,
 			})
 		}
-	} else if observe && !policy.MatchesAllowlist(identity, target, allowed, strict) {
-		_ = emit(runID, "proxy", "policy.amend", map[string]interface{}{
-			"action": "allow_server", "server": identity, "decision": "would_flag", "source": policy.SourceSessionContract,
-		})
 	}
 
 	if err := session.WriteCurrentRun(centrolDir(root), session.RunMarker{
@@ -192,7 +249,7 @@ func cmdProxyRun(args []string) {
 	// functions; clearMarker is called explicitly on every exit path
 	// past this point instead.
 
-	_ = emit(runID, "proxy", "run.start", map[string]interface{}{"target": target})
+	_ = emit(runID, "proxy", "run.start", map[string]interface{}{"target": targetDesc})
 
 	stopScope := make(chan struct{})
 	go func() {
@@ -250,6 +307,24 @@ func cmdProxyRun(args []string) {
 		fatalf("centrol proxy: %v", err)
 	}
 
+	// http_timeout_seconds/http_max_retries only govern an HTTP target
+	// (transport.HTTPTarget's Timeout/MaxRetries below) — resolved only
+	// for useHTTP so a misconfigured value in that section never fails
+	// an unrelated stdio run.
+	var httpTimeoutSec, httpMaxRetries int
+	if useHTTP {
+		httpTimeoutSec, _, err = policy.ResolveProxyHTTPTimeoutSeconds(resolver)
+		if err != nil {
+			printSummaryAndClear()
+			fatalf("centrol proxy: %v", err)
+		}
+		httpMaxRetries, _, err = policy.ResolveProxyHTTPMaxRetries(resolver)
+		if err != nil {
+			printSummaryAndClear()
+			fatalf("centrol proxy: %v", err)
+		}
+	}
+
 	prompt := proxy.StderrPrompt(os.Stderr, time.Duration(promptTimeoutSec)*time.Second)
 	interceptor := proxy.NewInterceptor(runID, gc.get(), emit, prompt, allowSessionAmend)
 	interceptor.Observe = observe
@@ -273,10 +348,20 @@ func cmdProxyRun(args []string) {
 
 	// Unlike centrol guard (which hands signal responsibility to
 	// terminal.Run's own forwarding once the wrapped agent starts),
-	// proxy.Run has no signal handling of its own — it manages the
-	// target subprocess directly over stdio. So the early handler stays
+	// neither proxy.Run nor proxy.RunTarget has signal handling of its
+	// own — they manage the target directly. So the early handler stays
 	// armed for the whole call instead of handing off partway through.
-	runErr := proxy.Run(proxy.Target{Command: fields[0], Args: fields[1:]}, interceptor, os.Stdin, os.Stdout, os.Stderr)
+	var runErr error
+	if useHTTP {
+		httpTarget := &transport.HTTPTarget{
+			URL:        targetURL,
+			Timeout:    time.Duration(httpTimeoutSec) * time.Second,
+			MaxRetries: httpMaxRetries,
+		}
+		runErr = proxy.RunTarget(httpTarget, interceptor, os.Stdin, os.Stdout, os.Stderr)
+	} else {
+		runErr = proxy.Run(proxy.Target{Command: fields[0], Args: fields[1:]}, interceptor, os.Stdin, os.Stdout, os.Stderr)
+	}
 	stopEarlySignal()
 	close(stopScope)
 

@@ -3,7 +3,9 @@ package transport
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -373,4 +375,107 @@ func isErrHTTPTimeout(err error) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// flakyDialTransport is an http.RoundTripper test double that fails
+// with a dial error (*net.OpError{Op: "dial"}) on its first `failures`
+// calls, then delegates to respFunc — letting these tests drive
+// HTTPTarget.Send's retry loop deterministically, without depending on
+// real network timing to produce a genuine connection-refused error.
+type flakyDialTransport struct {
+	failures int
+	calls    int
+	respFunc func() (*http.Response, error)
+}
+
+func (f *flakyDialTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.calls++
+	if f.calls <= f.failures {
+		return nil, &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	}
+	return f.respFunc()
+}
+
+func jsonOKResponse(id interface{}) (*http.Response, error) {
+	resp, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": id, "result": map[string]interface{}{"ok": true},
+	})
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(string(resp))),
+	}, nil
+}
+
+func TestHTTPTargetRetriesOnDialFailureUpToMaxRetries(t *testing.T) {
+	rt := &flakyDialTransport{failures: 2, respFunc: func() (*http.Response, error) { return jsonOKResponse("1") }}
+	target := &HTTPTarget{URL: "http://example.invalid/mcp", MaxRetries: 2, Client: &http.Client{Transport: rt}}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`)) }()
+
+	drainOne(t, ch)
+	if err := <-sendErr; err != nil {
+		t.Fatalf("expected Send to succeed after retrying past 2 dial failures, got: %v", err)
+	}
+	if rt.calls != 3 {
+		t.Fatalf("expected exactly 3 attempts (2 failures + 1 success), got %d", rt.calls)
+	}
+}
+
+func TestHTTPTargetStopsRetryingOnceMaxRetriesExhausted(t *testing.T) {
+	rt := &flakyDialTransport{failures: 100, respFunc: func() (*http.Response, error) { return jsonOKResponse("1") }}
+	target := &HTTPTarget{URL: "http://example.invalid/mcp", MaxRetries: 1, Client: &http.Client{Transport: rt}}
+	_ = target.Start(context.Background())
+
+	err := target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`))
+	if err == nil {
+		t.Fatal("expected Send to fail once every dial attempt fails")
+	}
+	if rt.calls != 2 {
+		t.Fatalf("expected exactly 2 attempts (1 initial + 1 retry), got %d", rt.calls)
+	}
+}
+
+func TestHTTPTargetDoesNotRetryNonDialErrors(t *testing.T) {
+	rt := &flakyDialTransport{
+		failures: 0,
+		respFunc: func() (*http.Response, error) { return nil, errors.New("some non-dial transport failure") },
+	}
+	target := &HTTPTarget{URL: "http://example.invalid/mcp", MaxRetries: 5, Client: &http.Client{Transport: rt}}
+	_ = target.Start(context.Background())
+
+	err := target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`))
+	if err == nil {
+		t.Fatal("expected Send to fail on a non-dial error")
+	}
+	if rt.calls != 1 {
+		t.Fatalf("expected exactly 1 attempt — a non-dial error must never be retried, regardless of MaxRetries — got %d", rt.calls)
+	}
+}
+
+func TestHTTPTargetDoesNotRetryAfterAResponseWasReceived(t *testing.T) {
+	// A 500 means the request definitely reached the server and was
+	// processed (however badly) — retrying could double-fire whatever
+	// the request asked the server to do. MaxRetries must not apply
+	// here even though it's nonzero.
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL, MaxRetries: 3}
+	_ = target.Start(context.Background())
+
+	err := target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`))
+	if err == nil {
+		t.Fatal("expected Send to surface the 500 as an error")
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 request — a received response must never be retried — got %d", calls)
+	}
 }

@@ -76,3 +76,60 @@ func TestResolveObserveModeDefaultFalse(t *testing.T) {
 		t.Fatalf("expected default false, got %v/%s (err=%v)", observe, src, err)
 	}
 }
+
+func TestResolveProxyTargetURLDefaultEmpty(t *testing.T) {
+	r := NewResolver(NewDefaultSource(nil))
+	url, src, err := ResolveProxyTargetURL(r)
+	if err != nil || url != "" || src != SourceDefault {
+		t.Fatalf("expected default \"\", got %q/%s (err=%v)", url, src, err)
+	}
+
+	dir := t.TempDir()
+	repo := NewLocalFileSource(SourceRepoConfig, filepath.Join(dir, "r.toml"))
+	repo.Write("proxy.target_url", "https://example.com/mcp")
+	r2 := NewResolver(repo, NewDefaultSource(nil))
+	url, src, err = ResolveProxyTargetURL(r2)
+	if err != nil || url != "https://example.com/mcp" || src != SourceRepoConfig {
+		t.Fatalf("expected https://example.com/mcp from repo_config, got %q/%s (err=%v)", url, src, err)
+	}
+}
+
+func TestResolveProxyHTTPTimeoutSecondsDefaultAndFloor(t *testing.T) {
+	r := NewResolver(NewDefaultSource(nil))
+	n, src, err := ResolveProxyHTTPTimeoutSeconds(r)
+	if err != nil || n != DefaultHTTPTimeoutSeconds || src != SourceDefault {
+		t.Fatalf("expected default %d, got %d/%s (err=%v)", DefaultHTTPTimeoutSeconds, n, src, err)
+	}
+
+	dir := t.TempDir()
+	user := NewLocalFileSource(SourceUserConfig, filepath.Join(dir, "u.toml"))
+	user.Write("proxy.http_timeout_seconds", 2)
+	r2 := NewResolver(user, NewDefaultSource(nil))
+	_, _, err = ResolveProxyHTTPTimeoutSeconds(r2)
+	if err == nil {
+		t.Fatalf("expected 2 (below the 5s floor) to be rejected")
+	}
+}
+
+func TestResolveProxyHTTPMaxRetriesDefaultAndFloor(t *testing.T) {
+	r := NewResolver(NewDefaultSource(nil))
+	n, src, err := ResolveProxyHTTPMaxRetries(r)
+	if err != nil || n != DefaultHTTPMaxRetries || src != SourceDefault {
+		t.Fatalf("expected default %d, got %d/%s (err=%v)", DefaultHTTPMaxRetries, n, src, err)
+	}
+
+	dir := t.TempDir()
+	user := NewLocalFileSource(SourceUserConfig, filepath.Join(dir, "u.toml"))
+	user.Write("proxy.http_max_retries", -1)
+	r2 := NewResolver(user, NewDefaultSource(nil))
+	_, _, err = ResolveProxyHTTPMaxRetries(r2)
+	if err == nil {
+		t.Fatalf("expected -1 (below the 0 floor) to be rejected")
+	}
+
+	user.Write("proxy.http_max_retries", 5)
+	n, src, err = ResolveProxyHTTPMaxRetries(r2)
+	if err != nil || n != 5 || src != SourceUserConfig {
+		t.Fatalf("expected 5/user_config, got %d/%s (err=%v)", n, src, err)
+	}
+}

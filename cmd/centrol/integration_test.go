@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1013,5 +1015,116 @@ func TestShipCriterion9_ProxySummaryPrintsOnNormalExit(t *testing.T) {
 	_, stderr, _ := centrol(t, dir, "proxy", "--target", "cat")
 	if !strings.Contains(stderr, "Run complete") {
 		t.Fatalf("expected proxy to print a run summary on exit, got:\n%s", stderr)
+	}
+}
+
+// ===========================================================================
+// v0.2.0 pass 3: --target-url CLI/config wiring.
+// ===========================================================================
+
+func TestProxyTargetAndTargetURLAreMutuallyExclusive(t *testing.T) {
+	dir := initTestRepo(t)
+	_, stderr, code := centrol(t, dir, "proxy", "--target", "cat", "--target-url", "http://127.0.0.1:1/ignored")
+	if code != 1 {
+		t.Fatalf("expected exit 1, got %d; stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "mutually exclusive") {
+		t.Fatalf("expected a mutual-exclusivity error, got:\n%s", stderr)
+	}
+}
+
+func TestProxyRequiresTargetOrTargetURL(t *testing.T) {
+	dir := initTestRepo(t)
+	_, stderr, code := centrol(t, dir, "proxy")
+	if code != 1 {
+		t.Fatalf("expected exit 1, got %d; stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "usage:") {
+		t.Fatalf("expected a usage error, got:\n%s", stderr)
+	}
+}
+
+// echoJSONRPCServer replies to every POST with a JSON-RPC result frame
+// carrying the request's own id, so a test can confirm a request that
+// went in through the proxy really was forwarded over HTTP and really
+// came back, rather than merely that the process exited cleanly.
+func echoJSONRPCServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&env)
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0", "id": env["id"], "result": map[string]interface{}{"ok": true},
+		})
+		_, _ = w.Write(resp)
+	}))
+}
+
+func TestProxyTargetURLFlagForwardsThroughHTTPTarget(t *testing.T) {
+	dir := initTestRepo(t)
+	srv := echoJSONRPCServer(t)
+	defer srv.Close()
+
+	// --observe: evaluated exactly as normal but never blocks or
+	// prompts, so this test exercises the HTTP transport wiring itself
+	// without also depending on the tool-name allowlist/policy tiers.
+	cmd := exec.Command(binPath, "proxy", "--target-url", srv.URL, "--observe")
+	cmd.Dir = dir
+	cmd.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a.go"}}}` + "\n")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	_ = cmd.Run() // stdin EOF ends the run; a non-zero exit here isn't itself a failure
+
+	if !strings.Contains(stdout.String(), `"ok":true`) {
+		t.Fatalf("expected the HTTP target's response forwarded to stdout, got: %q (stderr: %s)", stdout.String(), stderr.String())
+	}
+}
+
+func TestProxyTargetURLFromConfigIsUsedWhenNoFlagsGiven(t *testing.T) {
+	dir := initTestRepo(t)
+	srv := echoJSONRPCServer(t)
+	defer srv.Close()
+
+	if err := os.MkdirAll(filepath.Join(dir, ".centrol"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configContent := fmt.Sprintf("[proxy]\ntarget_url = %q\n", srv.URL)
+	if err := os.WriteFile(filepath.Join(dir, ".centrol", "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(binPath, "proxy", "--observe")
+	cmd.Dir = dir
+	cmd.Stdin = strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a.go"}}}` + "\n")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	_ = cmd.Run()
+
+	if !strings.Contains(stdout.String(), `"ok":true`) {
+		t.Fatalf("expected the configured target_url to be used with no flags given, got stdout: %q (stderr: %s)", stdout.String(), stderr.String())
+	}
+}
+
+func TestProxyTargetFlagOverridesConfiguredTargetURL(t *testing.T) {
+	dir := initTestRepo(t)
+
+	if err := os.MkdirAll(filepath.Join(dir, ".centrol"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A target_url that would fail loudly if it were ever actually used
+	// — port 1 refuses immediately — so this test can tell the
+	// difference between "the flag correctly overrode this" and "it
+	// happened to work anyway."
+	configContent := "[proxy]\ntarget_url = \"http://127.0.0.1:1/unused\"\n"
+	if err := os.WriteFile(filepath.Join(dir, ".centrol", "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, _ := centrol(t, dir, "proxy", "--target", "cat")
+	if !strings.Contains(stderr, "Run complete") {
+		t.Fatalf("expected --target to override the configured target_url and run against stdio cleanly, got stderr:\n%s", stderr)
 	}
 }

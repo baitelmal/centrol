@@ -14,6 +14,9 @@ const (
 	KeyWatcherDebounceMS     = "guard.watcher_debounce_ms"
 	KeyLogLevel              = "general.log_level"
 	KeyObserveMode           = "general.observe_mode"
+	KeyProxyTargetURL        = "proxy.target_url"
+	KeyProxyHTTPTimeoutSecs  = "proxy.http_timeout_seconds"
+	KeyProxyHTTPMaxRetries   = "proxy.http_max_retries"
 )
 
 const (
@@ -22,6 +25,10 @@ const (
 	DefaultMCPCallTimeoutSeconds = 60
 	MinMCPCallTimeoutSeconds     = 5
 	DefaultWatcherDebounceMS     = 100
+	DefaultHTTPTimeoutSeconds    = 60
+	MinHTTPTimeoutSeconds        = 5
+	DefaultHTTPMaxRetries        = 2
+	MinHTTPMaxRetries            = 0
 )
 
 // ResolvePromptTimeoutSeconds resolves gate.prompt_timeout_seconds,
@@ -248,4 +255,67 @@ func ResolveStrictMatching(r *Resolver) (strict bool, source string, err error) 
 		return false, "", fmt.Errorf("%s must be true or false, got %v (from %s)", KeyStrictMatching, raw, src)
 	}
 	return b, src, nil
+}
+
+// ResolveProxyTargetURL resolves proxy.target_url, defaulting to ""
+// (unset). An empty result means no HTTP target is configured — the
+// caller (cmd/centrol's --target-url/--target resolution) treats that
+// the same as the key being absent, not as an error.
+func ResolveProxyTargetURL(r *Resolver) (url string, source string, err error) {
+	raw, src, found, err := r.Resolve(KeyProxyTargetURL)
+	if err != nil {
+		return "", "", err
+	}
+	if !found {
+		return "", SourceDefault, nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", "", fmt.Errorf("%s must be a string, got %v (from %s)", KeyProxyTargetURL, raw, src)
+	}
+	return s, src, nil
+}
+
+// ResolveProxyHTTPTimeoutSeconds resolves proxy.http_timeout_seconds,
+// defaulting to DefaultHTTPTimeoutSeconds and enforcing the hard floor
+// MinHTTPTimeoutSeconds — same shape as ResolveMCPCallTimeoutSeconds.
+func ResolveProxyHTTPTimeoutSeconds(r *Resolver) (seconds int, source string, err error) {
+	raw, src, found, err := r.Resolve(KeyProxyHTTPTimeoutSecs)
+	if err != nil {
+		return 0, "", err
+	}
+	if !found {
+		return DefaultHTTPTimeoutSeconds, SourceDefault, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, "", fmt.Errorf("%s must be an integer, got %v (from %s)", KeyProxyHTTPTimeoutSecs, raw, src)
+	}
+	if n < MinHTTPTimeoutSeconds {
+		return 0, "", fmt.Errorf("%s = %d is below the minimum of %d (from %s)", KeyProxyHTTPTimeoutSecs, n, MinHTTPTimeoutSeconds, src)
+	}
+	return n, src, nil
+}
+
+// ResolveProxyHTTPMaxRetries resolves proxy.http_max_retries, defaulting
+// to DefaultHTTPMaxRetries and enforcing the hard floor MinHTTPMaxRetries
+// (0 — retries are optional, never negative). See HTTPTarget.MaxRetries
+// for what "idempotent only" means here: a retry only ever happens for a
+// dial failure, where the request provably never reached the server.
+func ResolveProxyHTTPMaxRetries(r *Resolver) (retries int, source string, err error) {
+	raw, src, found, err := r.Resolve(KeyProxyHTTPMaxRetries)
+	if err != nil {
+		return 0, "", err
+	}
+	if !found {
+		return DefaultHTTPMaxRetries, SourceDefault, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, "", fmt.Errorf("%s must be an integer, got %v (from %s)", KeyProxyHTTPMaxRetries, raw, src)
+	}
+	if n < MinHTTPMaxRetries {
+		return 0, "", fmt.Errorf("%s = %d cannot be negative (from %s)", KeyProxyHTTPMaxRetries, n, src)
+	}
+	return n, src, nil
 }
