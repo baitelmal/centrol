@@ -350,3 +350,7 @@ Only Tier 1 exists today. Tiers 2 and 3 are direction, not a promise.
 - A failed rollback never leaves the tree worse than the agent left it.
 - `centrol proxy`'s client-facing stdout carries nothing but JSON-RPC
   frames — every prompt and error goes to stderr or the controlling tty.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
