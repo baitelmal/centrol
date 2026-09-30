@@ -1,0 +1,11 @@
+# centrol's own default ignore patterns (node_modules, .venv, dist,
+# build, .next, __pycache__) are always applied even without this file.
+# Add repo-specific patterns below, one per line. Plain names match any
+# path component (e.g. "vendor" matches "a/vendor/b"); anything with a
+# glob character or a slash is matched against the full repo-relative
+# path via shell globbing.
+
+vendor
+coverage
+*.log
+.DS_Store
