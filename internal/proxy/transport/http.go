@@ -136,6 +136,13 @@ func (t *HTTPTarget) Receive() (<-chan []byte, error) {
 // Send retries sendOnce up to MaxRetries times, but only when the
 // failure was a dial failure — see MaxRetries's doc comment for why
 // that's the only case a retry is safe here.
+//
+// Send retries only on dial failures. It does not retry on 5xx
+// responses or mid-request timeouts, even though the prompt
+// originally allowed 5xx retry: at this layer, Send has no
+// visibility into whether the JSON-RPC method is idempotent,
+// so a 5xx that may have already processed the request is not
+// safe to retry.
 func (t *HTTPTarget) Send(frame []byte) error {
 	for attempt := 0; ; attempt++ {
 		err := t.sendOnce(frame)
