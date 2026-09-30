@@ -41,24 +41,26 @@ type targetErrReporter interface {
 	Err() error
 }
 
-// targetInputCloser is an optional capability a transport.Target may
-// implement to signal "no more input is coming" without waiting for
-// the target's own exit — e.g. closing a spawned subprocess's stdin
-// so it can exit on its own if it reads until EOF, exactly like
-// closing targetStdin did in the pre-pass-1 stdio path. Not part of
-// transport.Target, since a request/response transport (HTTP, added
-// in a later pass) has no persistent input stream to half-close;
-// RunTarget checks for it via a type assertion.
-type targetInputCloser interface {
-	CloseInput() error
+// targetWaiter is an optional capability a transport.Target may
+// implement to block until it has fully finished shutting down, after
+// Stop has signaled it to do so — e.g. transport.StdioTarget.Wait,
+// which calls cmd.Wait() to reap the subprocess. Not part of
+// transport.Target: a transport with no persistent process or
+// connection to wait for (HTTPTarget — Stop's channel-close already
+// covers everything there is to wait for) has nothing meaningful to
+// implement here. RunTarget checks for it via a type assertion.
+type targetWaiter interface {
+	Wait() error
 }
 
 // RunTarget wires clientIn -> target and target -> clientOut through
 // the Interceptor for any transport.Target, and blocks until the
-// target exits (Stop returns) or an unrecoverable pipe error occurs.
-// Run (above) is this generalized over transport.StdioTarget — the
-// stable stdio entry point; a later pass adds the equivalent HTTP
-// entry point, driven through this same function.
+// target has fully shut down (Stop has signaled it and, if the
+// target implements targetWaiter, Wait has returned) or an
+// unrecoverable pipe error occurs. Run (above) is this generalized
+// over transport.StdioTarget — the stable stdio entry point; pass 2
+// adds the equivalent HTTP entry point, driven through this same
+// function.
 //
 // STDIO DISCIPLINE: clientOut receives ONLY JSON-RPC frames written via
 // WriteFrame. Every other message (errors, the FLAG UI) goes to
@@ -71,7 +73,25 @@ func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, cli
 	clientToTargetErr := make(chan error, 1)
 	targetToClientDone := make(chan error, 1) // this is the goroutine that writes to clientOut — RunTarget must not return until it has actually finished
 	var clientOutMu sync.Mutex                // WriteFrame calls interleave from both pump directions; guard the shared writer so frames never partially interleave on the wire.
-	var diagOutMu sync.Mutex                  // the capability-degrade debug notes below can fire from either pump goroutine; guard diagOut the same way clientOutMu guards clientOut.
+	var diagOutMu sync.Mutex                  // the capability-degrade debug note below can fire alongside the two pump goroutines; guard diagOut the same way clientOutMu guards clientOut.
+
+	// target.Stop() is the shutdown *signal* (see targetWaiter's doc
+	// comment for the signal/wait split) and must fire exactly once:
+	// twice would mean a second DELETE for HTTPTarget, or a second
+	// stdin-close race for StdioTarget. The client pump's own defer
+	// below is the normal trigger — signal shutdown once the client
+	// has stopped sending, which is also the earliest a request/response
+	// transport like HTTPTarget can fire Stop without cutting off
+	// traffic that's still in flight. stop() is called again,
+	// harmlessly (sync.Once), further down as a fallback for the case
+	// where the target ends on its own — exits, or errors out — before
+	// the client pump ever reaches that defer.
+	var stopOnce sync.Once
+	var stopErr error
+	stop := func() error {
+		stopOnce.Do(func() { stopErr = target.Stop() })
+		return stopErr
+	}
 
 	// Interceptor itself never touches clientOut (its job is evaluation
 	// and logging, not I/O) — so RunTarget supplies the one callback
@@ -93,22 +113,16 @@ func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, cli
 
 	// client -> target
 	go func() {
-		// Signals "no more input is coming" when this pump's own loop
-		// ends, for whatever reason — exactly matching the pre-pass-1
-		// stdio path's `defer targetStdin.Close()`. This is deliberately
-		// NOT the same thing as target.Stop() below (which waits for
-		// the target to exit): a target blocked reading until EOF needs
-		// this signal to ever exit on its own, independent of whether
-		// the target happens to exit for some other reason first.
-		defer func() {
-			if ic, ok := target.(targetInputCloser); ok {
-				_ = ic.CloseInput()
-			} else {
-				diagOutMu.Lock()
-				fmt.Fprintf(diagOut, "centrol: debug: target does not implement targetInputCloser — no stdin-close notification to send, by design for this transport\n")
-				diagOutMu.Unlock()
-			}
-		}()
+		// Signals shutdown when this pump's own loop ends, for whatever
+		// reason — "no more input is coming." For StdioTarget this closes
+		// stdin, exactly matching the pre-pass-1 stdio path's
+		// `defer targetStdin.Close()`, letting a target that reads until
+		// EOF exit on its own. For HTTPTarget this is the point analogous
+		// to that: the client has stopped sending, so the session's DELETE
+		// can fire without cutting off in-flight traffic. This is
+		// deliberately NOT the same thing as waiting for the target to
+		// actually finish exiting — see targetWaiter below.
+		defer func() { _ = stop() }()
 		clientLines, clientReadErr := ReadFrames(clientIn)
 		for line := range clientLines {
 			forward, fwdLine, blockResp, err := in.HandleClientRequest(line)
@@ -201,18 +215,42 @@ func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, cli
 		targetToClientDone <- nil
 	}()
 
-	waitErr := target.Stop()
-
-	// The target has exited, which closes its Receive channel and makes
-	// the target -> client goroutine's loop end shortly — but "shortly"
-	// is not "already", and that goroutine is the only other writer to
-	// clientOut. RunTarget must not return (and the caller must not
-	// treat clientOut as final) until it actually has. This is a real
-	// fix, not a defensive guess: without this blocking receive, a
-	// caller (or a test) reading clientOut right after RunTarget returns
-	// can race the final in-flight WriteFrame — see the race this closes
-	// in proxy_test.go.
+	// The target -> client goroutine's loop ends when its Receive
+	// channel closes: for StdioTarget, that follows the process exiting,
+	// which (if it reads until EOF) follows the client pump's stop()
+	// defer above closing stdin; for HTTPTarget, Stop() closes the
+	// channel directly. RunTarget must not return (and the caller must
+	// not treat clientOut as final) until this goroutine actually has —
+	// it is the only other writer to clientOut. This is a real fix, not
+	// a defensive guess: without this blocking receive, a caller (or a
+	// test) reading clientOut right after RunTarget returns can race the
+	// final in-flight WriteFrame — see the race this closes in
+	// proxy_test.go.
 	drainErr := <-targetToClientDone
+
+	// Fallback signal: guarantees Stop() has fired even if the client
+	// pump's own defer never ran — e.g. the target ended on its own,
+	// by clean exit or by error, while the client pump was still
+	// blocked reading clientIn. A no-op (sync.Once) if that defer
+	// already fired.
+	_ = stop()
+
+	// Now that Stop has signaled shutdown, wait for it to actually
+	// finish, if this target has anything left to wait for beyond what
+	// Stop itself already did (StdioTarget: reap the subprocess via
+	// cmd.Wait()). Not every transport.Target has such a phase — a
+	// request/response transport like HTTPTarget has nothing left to
+	// wait for once its receive channel is closed — so this is an
+	// optional check, same pattern as targetErrReporter above.
+	var waitErr error
+	if w, ok := target.(targetWaiter); ok {
+		waitErr = w.Wait()
+	} else {
+		diagOutMu.Lock()
+		fmt.Fprintf(diagOut, "centrol: debug: target does not implement targetWaiter — nothing left to wait for once Stop has signaled shutdown, by design for this transport\n")
+		diagOutMu.Unlock()
+	}
+
 	if drainErr != nil {
 		return drainErr
 	}
@@ -237,7 +275,11 @@ func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, cli
 		}
 	default:
 	}
-	return waitErr
+
+	if waitErr != nil {
+		return waitErr
+	}
+	return stopErr
 }
 
 // StderrPrompt is a PromptFunc that renders the FLAG UI ([Allow once |

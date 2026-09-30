@@ -44,13 +44,13 @@ func (e *HTTPStatusError) Error() string {
 //
 // Unlike StdioTarget, there is no persistent connection and no
 // subprocess to wait for — Stop's job here is session cleanup (the
-// best-effort DELETE), not waiting for anything to exit. Whoever
-// wires this into proxy.RunTarget (a later pass) should call Stop at
-// the point analogous to StdioTarget's CloseInput — once the client
-// is done sending, not at RunTarget's current "immediately,
-// concurrently with both pumps" Stop call site, which is timed for a
-// blocking Wait() and would end the HTTP session as soon as the run
-// starts if reused verbatim here.
+// best-effort DELETE) and closing the receive channel, and there is
+// nothing left to wait for once that's done, so HTTPTarget does not
+// implement targetWaiter. proxy.RunTarget calls Stop once the client
+// has stopped sending — the same point analogous to StdioTarget's
+// stdin-close — not at startup, so the DELETE reflects whatever
+// traffic the run actually sent rather than ending the session before
+// any of it goes out.
 type HTTPTarget struct {
 	URL string
 
@@ -74,9 +74,10 @@ type HTTPTarget struct {
 	// later, Pass 3's CLI wiring) can inject one.
 	Client *http.Client
 
-	mu     sync.Mutex
-	ctx    context.Context
-	recvCh chan []byte
+	mu      sync.Mutex
+	ctx     context.Context
+	recvCh  chan []byte
+	stopped bool
 }
 
 // Start records ctx for subsequent requests. Streamable HTTP has no
@@ -217,9 +218,22 @@ func (t *HTTPTarget) deliver(frame []byte) {
 // Stop sends a best-effort DELETE to terminate the session, if one
 // was issued, and closes the receive channel. DELETE errors are
 // intentionally ignored (cleanup, not a correctness requirement) per
-// the pass 2 spec.
+// the pass 2 spec. Idempotent: proxy.RunTarget calls Stop from more
+// than one place as a shutdown-signal fallback, and a second call
+// here is a no-op rather than a duplicate DELETE or a double-close of
+// the receive channel.
 func (t *HTTPTarget) Stop() error {
-	sid := t.getSessionID()
+	t.mu.Lock()
+	if t.stopped {
+		t.mu.Unlock()
+		return nil
+	}
+	t.stopped = true
+	sid := t.SessionID
+	ch := t.recvCh
+	t.recvCh = nil
+	t.mu.Unlock()
+
 	if sid != "" {
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, t.URL, nil)
 		if err == nil {
@@ -230,10 +244,6 @@ func (t *HTTPTarget) Stop() error {
 		}
 	}
 
-	t.mu.Lock()
-	ch := t.recvCh
-	t.recvCh = nil
-	t.mu.Unlock()
 	if ch != nil {
 		close(ch)
 	}

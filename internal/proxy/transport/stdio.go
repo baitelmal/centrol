@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sync"
 )
 
 // StdioTarget fronts an MCP server run as a child process speaking
@@ -25,6 +26,9 @@ type StdioTarget struct {
 
 	recvCh    <-chan []byte
 	recvErrFn func() error
+
+	mu      sync.Mutex
+	stopped bool
 }
 
 // NewStdioTarget returns a StdioTarget ready to Start. stderr receives
@@ -86,26 +90,33 @@ func (t *StdioTarget) Err() error {
 	return t.recvErrFn()
 }
 
-// CloseInput closes the target's stdin, signaling "no more input is
-// coming" without waiting for the target to exit. This lets a target
-// that reads until EOF exit on its own — exactly what closing
-// targetStdin did in the pre-pass-1 stdio path. Not part of the
-// Target interface (a request/response transport like HTTP has no
-// persistent input stream to half-close); callers that want it use a
-// type assertion.
-func (t *StdioTarget) CloseInput() error {
+// Stop signals shutdown by closing the target's stdin, without
+// waiting for the target to exit. This lets a target that reads until
+// EOF exit on its own — exactly what closing targetStdin did in the
+// pre-pass-1 stdio path, now reached through the Target interface.
+// Idempotent: a second call is a no-op, so callers (proxy.RunTarget
+// calls Stop from more than one place as a shutdown-signal fallback)
+// never risk a double-close.
+func (t *StdioTarget) Stop() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped {
+		return nil
+	}
+	t.stopped = true
 	if t.stdin == nil {
 		return nil
 	}
 	return t.stdin.Close()
 }
 
-// Stop waits for the target process to exit and returns its exit
+// Wait blocks until the target process exits and returns its exit
 // error, if any — the same cmd.Wait() the pre-pass-1 stdio path
-// called directly, reached through the interface now. Safe to call
-// concurrently with CloseInput/Send/Receive; it does not itself close
-// stdin.
-func (t *StdioTarget) Stop() error {
+// called directly, now split out from Stop (see proxy.targetWaiter)
+// so a caller can signal shutdown and wait for it to finish as two
+// separate steps. Must be called at most once, per cmd.Wait()'s own
+// contract; proxy.RunTarget guarantees this.
+func (t *StdioTarget) Wait() error {
 	if t.cmd == nil {
 		return nil
 	}

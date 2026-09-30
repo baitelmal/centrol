@@ -279,6 +279,41 @@ func TestHTTPTargetStopIgnoresDeleteErrors(t *testing.T) {
 	}
 }
 
+func TestHTTPTargetStopIsIdempotent(t *testing.T) {
+	var deleteCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleteCount++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Mcp-Session-Id", "sess-idem")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+	go func() { _ = target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`)) }()
+	drainOne(t, ch)
+
+	if err := target.Stop(); err != nil {
+		t.Fatalf("first Stop call: %v", err)
+	}
+	if err := target.Stop(); err != nil {
+		t.Fatalf("second Stop call: %v", err)
+	}
+	if err := target.Stop(); err != nil {
+		t.Fatalf("third Stop call: %v", err)
+	}
+
+	if deleteCount != 1 {
+		t.Fatalf("expected exactly one DELETE across three Stop calls, got %d", deleteCount)
+	}
+}
+
 func TestHTTPTargetAcceptedResponseHasNoFrameToForward(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)

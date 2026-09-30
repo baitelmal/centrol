@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"strings"
 	"sync"
@@ -12,6 +15,7 @@ import (
 	"time"
 
 	"github.com/scirem/centrol/internal/policy"
+	"github.com/scirem/centrol/internal/proxy/transport"
 )
 
 func testContract() policy.Contract {
@@ -938,20 +942,20 @@ func TestOutOfScopeDenialSuggestionDoesNotMentionCentrolScope(t *testing.T) {
 	}
 }
 
-// --- Pre-Pass-2 check: RunTarget's optional-capability degrade path
-// (targetInputCloser / targetErrReporter) must not silently skip a
-// transport.Target that implements only the four required methods —
-// it must drive it correctly and report the missing capability on
-// diagOut, never panic, and never skip the mandatory shutdown step
-// (target.Stop()). ---
+// --- Pre-Pass-2 check (extended by pass 2.5's targetWaiter split):
+// RunTarget's optional-capability degrade path (targetWaiter /
+// targetErrReporter) must not silently skip a transport.Target that
+// implements only the four required methods — it must drive it
+// correctly and report the missing capability on diagOut, never
+// panic, and never skip the mandatory shutdown signal (target.Stop()). ---
 
 // minimalTarget implements exactly transport.Target's four required
 // methods (Start, Send, Receive, Stop) — deliberately no Err() and no
-// CloseInput() — so it can never satisfy targetInputCloser or
-// targetErrReporter. It answers exactly one request: Send echoes back
-// a canned result for whatever id it was given and then closes its
-// receive channel, so the target -> client pump ends deterministically
-// without depending on when RunTarget happens to call Stop().
+// Wait() — so it can never satisfy targetErrReporter or targetWaiter.
+// It answers exactly one request: Send echoes back a canned result
+// for whatever id it was given and then closes its receive channel,
+// so the target -> client pump ends deterministically without
+// depending on when RunTarget happens to call Stop().
 type minimalTarget struct {
 	mu      sync.Mutex
 	ch      chan []byte
@@ -1078,30 +1082,141 @@ func TestRunTargetDrivesMinimalTargetWithoutOptionalCapabilities(t *testing.T) {
 		t.Fatalf("expected response id=1, got %v", resp["id"])
 	}
 
-	// The degrade path must not be silent-skip: RunTarget notes the
+	// The degrade path must not be silent-skip: RunTarget notes each
 	// missing capability on diagOut (never on clientOut — STDIO
-	// DISCIPLINE still applies). The targetErrReporter note is written
-	// by the target -> client pump, which RunTarget's return already
-	// waits on (via targetToClientDone) — it's present the instant
-	// RunTarget returns. The targetInputCloser note, though, is written
-	// by the client -> target pump, and RunTarget deliberately does NOT
-	// wait for that pump before returning (a live client's stdin may
-	// stay open long after the target exits — see the non-blocking
-	// select at the end of RunTarget), so here it can trail RunTarget's
-	// return by a scheduling instant even though clientIn already hit
-	// EOF. Poll briefly for it rather than asserting it's there the
-	// instant we wake up.
-	deadline := time.Now().Add(2 * time.Second)
-	for !strings.Contains(diag.String(), "targetInputCloser") {
-		if time.Now().After(deadline) {
-			t.Fatalf("expected a debug note about the missing targetInputCloser capability on diagOut, got: %q", diag.String())
-		}
-		time.Sleep(time.Millisecond)
+	// DISCIPLINE still applies). Both notes here are written on
+	// RunTarget's own return path — targetErrReporter's by the target ->
+	// client pump, which RunTarget's return already waits on (via
+	// targetToClientDone), and targetWaiter's synchronously in RunTarget
+	// itself, right after that same drain — so, unlike the old
+	// targetInputCloser note (written asynchronously from the client ->
+	// target pump's defer), both are guaranteed present the instant
+	// RunTarget returns; no polling needed.
+	if !strings.Contains(diag.String(), "targetWaiter") {
+		t.Fatalf("expected a debug note about the missing targetWaiter capability on diagOut, got: %q", diag.String())
 	}
 	if !strings.Contains(diag.String(), "targetErrReporter") {
 		t.Fatalf("expected a debug note about the missing targetErrReporter capability on diagOut, got: %q", diag.String())
 	}
 	if strings.Contains(clientOut.String(), "debug:") {
 		t.Fatalf("the capability-degrade debug note leaked onto clientOut, violating STDIO DISCIPLINE: %q", clientOut.String())
+	}
+}
+
+// --- Pass 2.5: RunTarget driving a transport.HTTPTarget end-to-end,
+// verifying Stop's DELETE is timed correctly by RunTarget's own
+// shutdown sequence (not just by HTTPTarget's own unit tests, which
+// call Stop directly rather than through RunTarget). ---
+
+func TestRunTargetWithHTTPTargetSendsDeleteOnlyAfterBothResponsesForwarded(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			mu.Lock()
+			events = append(events, "delete")
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var env map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
+			t.Errorf("decoding request body: %v", err)
+		}
+		id := env["id"]
+		mu.Lock()
+		events = append(events, fmt.Sprintf("response-%v", id))
+		mu.Unlock()
+		w.Header().Set("Mcp-Session-Id", "sess-order")
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0", "id": id, "result": map[string]interface{}{"ok": true},
+		})
+		_, _ = w.Write(resp)
+	}))
+	defer srv.Close()
+
+	rec := &recorder{}
+	in := NewInterceptor("run-1", testContract(), rec.emit, nil, true)
+
+	line1 := toolCallLine(t, "1", "read_file", map[string]interface{}{"path": "a.go"})
+	line2 := toolCallLine(t, "2", "read_file", map[string]interface{}{"path": "b.go"})
+	clientIn := strings.NewReader(string(line1) + "\n" + string(line2) + "\n")
+
+	target := &transport.HTTPTarget{URL: srv.URL}
+	var clientOut, diag bytes.Buffer
+
+	var runErr error
+	done := make(chan struct{})
+	go func() {
+		runErr = RunTarget(target, in, clientIn, &clientOut, &diag)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunTarget did not return against an HTTPTarget")
+	}
+	if runErr != nil {
+		t.Fatalf("expected RunTarget to complete without error, got: %v", runErr)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events (two responses, then one delete), got %d: %v", len(events), events)
+	}
+	if events[2] != "delete" {
+		t.Fatalf("expected DELETE to be the last event, fired only after both responses were forwarded — got order: %v", events)
+	}
+}
+
+func TestRunTargetWithHTTPTargetSendsNoDeleteIfClientClosesBeforeAnyRequest(t *testing.T) {
+	var mu sync.Mutex
+	var deleteSeen bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			mu.Lock()
+			deleteSeen = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		t.Errorf("unexpected %s request: no client call was ever sent, so the target should never see traffic", r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	rec := &recorder{}
+	in := NewInterceptor("run-1", testContract(), rec.emit, nil, true)
+
+	clientIn := strings.NewReader("") // EOF immediately: the client never sends a request.
+
+	target := &transport.HTTPTarget{URL: srv.URL}
+	var clientOut, diag bytes.Buffer
+
+	var runErr error
+	done := make(chan struct{})
+	go func() {
+		runErr = RunTarget(target, in, clientIn, &clientOut, &diag)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunTarget did not return against an HTTPTarget with no client traffic")
+	}
+	if runErr != nil {
+		t.Fatalf("expected RunTarget to complete without error, got: %v", runErr)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if deleteSeen {
+		t.Fatal("expected no DELETE to be sent when no request ever established a session")
 	}
 }
