@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://scirem.systems/schemas/event.v1.json",
+  "title": "centrol ledger event v1",
+  "description": "Frozen schema for entries in the centrol hash-chained ledger (lighthouse.jsonl). This schema is loaded at Governor startup and drives signal validation. Do not modify for this release; bump 'v' and create event.v2.json for breaking changes.",
+  "type": "object",
+  "required": ["v", "seq", "ts", "run", "src", "type", "payload", "prev", "hash"],
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version this entry conforms to."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing sequence number, global across segments."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339 timestamp of when the Governor accepted the event."
+    },
+    "run": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Run identifier this event belongs to."
+    },
+    "src": {
+      "type": "string",
+      "enum": ["guard", "proxy", "verify"],
+      "description": "Which surface emitted the underlying signal. 'verify' is reserved for the v0.3 validator surface; nothing emits it yet."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "run.start", "run.end", "run.snapshot", "run.rollback",
+        "fs.write", "fs.delete", "fs.create",
+        "tool.call", "tool.result", "tool.blocked",
+        "policy.violation", "policy.silence", "policy.amend",
+        "contract.declare",
+        "ledger.seal", "ledger.rotate",
+        "verify.start", "verify.end", "verify.attempt",
+        "verify.test_result", "verify.invariant_pass", "verify.invariant_fail",
+        "verify.packet_emitted", "verify.approved", "verify.rejected", "verify.auto_approved"
+      ],
+      "description": "Event type. Non-conforming raw signals are recorded as policy.silence, never rejected outright. The verify.* types are reserved for the v0.3 validator surface (see x-reservedVerifyPayloads below) and are valid against this schema today so that shipping verify in a later release requires no version bump; nothing emits them yet."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Event-type-specific structured data."
+    },
+    "prev": {
+      "type": "string",
+      "description": "sha256 hex digest of the previous entry (global chain, crosses segment boundaries). Empty string only for the very first entry ever written."
+    },
+    "hash": {
+      "type": "string",
+      "description": "sha256 hex digest of this entry with the hash field itself excluded."
+    }
+  },
+  "x-reservedVerifyPayloads": {
+    "$comment": "Documentation only, not enforced by this schema's validation (payload is typed loosely as 'object' above so v0.1/v0.2 don't need per-type payload validation). Recorded here so the verify surface's payload shapes are settled before it ships and adding it later needs no schema version bump.",
+    "verify.start": { "task_id": "string", "contract_id": "string", "repo_ref": "string" },
+    "verify.end": { "task_id": "string", "outcome": "string", "attempts": "integer", "duration_ms": "integer" },
+    "verify.attempt": { "attempt": "integer", "diff_hash": "string", "scope": "string" },
+    "verify.test_result": { "attempt": "integer", "target": "string", "pass": "boolean", "duration_ms": "integer", "log_hash": "string" },
+    "verify.invariant_pass": { "attempt": "integer", "invariant": "string", "evidence_hash": "string" },
+    "verify.invariant_fail": { "attempt": "integer", "invariant": "string", "reason": "string" },
+    "verify.packet_emitted": { "packet_id": "string", "diff_hash": "string", "tests_hash": "string" },
+    "verify.approved": { "packet_id": "string", "actor": "string" },
+    "verify.rejected": { "packet_id": "string", "actor": "string", "reason": "string" },
+    "verify.auto_approved": { "packet_id": "string", "conditions": "string" }
+  }
+}
