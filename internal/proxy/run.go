@@ -1,58 +1,87 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"os/exec"
 	"sync"
 	"time"
 
 	"github.com/scirem/centrol/internal/gate"
+	"github.com/scirem/centrol/internal/proxy/transport"
 )
 
-// Target describes how to reach the real MCP server this proxy fronts.
+// Target describes how to reach the real MCP server this proxy fronts
+// as a stdio subprocess (a command to spawn). This is the stable
+// public shape Run and every existing stdio caller already use; it is
+// unchanged by the v0.2.0 pass 1 transport-interface refactor below.
 type Target struct {
 	Command string
 	Args    []string
 }
 
-// Run spawns the target as a child process, wires clientIn -> target and
-// target -> clientOut through the Interceptor, and blocks until the
-// target exits or an unrecoverable pipe error occurs.
+// Run spawns target as a child process and drives it through
+// RunTarget via a transport.StdioTarget. Behavior is unchanged from
+// the pre-v0.2.0 stdio path — this refactor only moved the
+// exec.Command wiring into internal/proxy/transport; every pump,
+// STDIO DISCIPLINE guarantee, and error path below is identical.
+func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer, diagOut io.Writer) error {
+	st := transport.NewStdioTarget(target.Command, target.Args, diagOut)
+	return RunTarget(st, in, clientIn, clientOut, diagOut)
+}
+
+// targetErrReporter is an optional capability a transport.Target may
+// implement to report why its Receive() channel closed: nil for a
+// clean end, or the underlying read failure otherwise (see
+// transport.StdioTarget.Err). Not part of transport.Target itself,
+// since not every transport has a meaningful distinction here;
+// RunTarget checks for it via a type assertion.
+type targetErrReporter interface {
+	Err() error
+}
+
+// targetInputCloser is an optional capability a transport.Target may
+// implement to signal "no more input is coming" without waiting for
+// the target's own exit — e.g. closing a spawned subprocess's stdin
+// so it can exit on its own if it reads until EOF, exactly like
+// closing targetStdin did in the pre-pass-1 stdio path. Not part of
+// transport.Target, since a request/response transport (HTTP, added
+// in a later pass) has no persistent input stream to half-close;
+// RunTarget checks for it via a type assertion.
+type targetInputCloser interface {
+	CloseInput() error
+}
+
+// RunTarget wires clientIn -> target and target -> clientOut through
+// the Interceptor for any transport.Target, and blocks until the
+// target exits (Stop returns) or an unrecoverable pipe error occurs.
+// Run (above) is this generalized over transport.StdioTarget — the
+// stable stdio entry point; a later pass adds the equivalent HTTP
+// entry point, driven through this same function.
 //
 // STDIO DISCIPLINE: clientOut receives ONLY JSON-RPC frames written via
 // WriteFrame. Every other message (errors, the FLAG UI) goes to
 // diagOut (stderr) or the controlling TTY, never here.
-func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer, diagOut io.Writer) error {
-	cmd := exec.Command(target.Command, target.Args...)
-	cmd.Stderr = diagOut // the target's own stderr is diagnostic, never client-facing stdout
+func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer, diagOut io.Writer) error {
+	_ = diagOut // kept for signature symmetry with Run/StderrPrompt; the transport itself owns where its own stderr goes (see transport.NewStdioTarget)
 
-	targetStdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("proxy: target stdin pipe: %w", err)
-	}
-	targetStdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("proxy: target stdout pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("proxy: starting target %q: %w", target.Command, err)
+	if err := target.Start(context.Background()); err != nil {
+		return err
 	}
 
 	clientToTargetErr := make(chan error, 1)
-	targetToClientDone := make(chan error, 1) // this is the goroutine that writes to clientOut — Run must not return until it has actually finished
+	targetToClientDone := make(chan error, 1) // this is the goroutine that writes to clientOut — RunTarget must not return until it has actually finished
 	var clientOutMu sync.Mutex                // WriteFrame calls interleave from both pump directions; guard the shared writer so frames never partially interleave on the wire.
 
 	// Interceptor itself never touches clientOut (its job is evaluation
-	// and logging, not I/O) — so Run supplies the one callback that
-	// needs to, bound to the same mutex the two pump goroutines below
-	// already share. This must be set before either goroutine starts:
-	// a tools/call forwarded in the first few lines of the client pump
-	// can already be arming its timeout by the time this function
-	// returns from Run's caller's perspective, and OnTimeout must be
-	// ready by then.
+	// and logging, not I/O) — so RunTarget supplies the one callback
+	// that needs to, bound to the same mutex the two pump goroutines
+	// below already share. This must be set before either goroutine
+	// starts: a tools/call forwarded in the first few lines of the
+	// client pump can already be arming its timeout by the time this
+	// function returns from the caller's perspective, and OnTimeout
+	// must be ready by then.
 	in.OnTimeout = func(id json.RawMessage, tool string, elapsed time.Duration) {
 		resp, err := timeoutErrorResponse(id, tool)
 		if err != nil {
@@ -65,7 +94,18 @@ func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer
 
 	// client -> target
 	go func() {
-		defer targetStdin.Close()
+		// Signals "no more input is coming" when this pump's own loop
+		// ends, for whatever reason — exactly matching the pre-pass-1
+		// stdio path's `defer targetStdin.Close()`. This is deliberately
+		// NOT the same thing as target.Stop() below (which waits for
+		// the target to exit): a target blocked reading until EOF needs
+		// this signal to ever exit on its own, independent of whether
+		// the target happens to exit for some other reason first.
+		defer func() {
+			if ic, ok := target.(targetInputCloser); ok {
+				_ = ic.CloseInput()
+			}
+		}()
 		clientLines, clientReadErr := ReadFrames(clientIn)
 		for line := range clientLines {
 			forward, fwdLine, blockResp, err := in.HandleClientRequest(line)
@@ -74,7 +114,7 @@ func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer
 				return
 			}
 			if forward {
-				if err := WriteFrame(targetStdin, fwdLine); err != nil {
+				if err := target.Send(fwdLine); err != nil {
 					clientToTargetErr <- fmt.Errorf("proxy: writing to target: %w", err)
 					return
 				}
@@ -109,7 +149,11 @@ func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer
 
 	// target -> client
 	go func() {
-		targetLines, targetReadErr := ReadFrames(targetStdout)
+		targetLines, err := target.Receive()
+		if err != nil {
+			targetToClientDone <- fmt.Errorf("proxy: receiving from target: %w", err)
+			return
+		}
 		for line := range targetLines {
 			fwdLine, err := in.HandleTargetResponse(line)
 			if err != nil {
@@ -134,29 +178,33 @@ func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer
 		}
 		// Same distinction as the client -> target pump above: a clean
 		// close here is the target exiting normally (the expected,
-		// common case handled below via cmd.Wait()); a non-nil error
-		// means the target's stdout stream itself failed mid-read.
-		if rerr := targetReadErr(); rerr != nil {
-			_ = in.Emit(in.RunID, "proxy", "policy.silence", map[string]interface{}{
-				"reason": "stream read error", "stream": "targetStdout", "error": rerr.Error(),
-			})
-			targetToClientDone <- fmt.Errorf("proxy: reading from target: %w", rerr)
-			return
+		// common case handled below via target.Stop()); a non-nil error
+		// means the target's own read stream failed mid-read. Not every
+		// transport.Target distinguishes the two (see targetErrReporter),
+		// so this is an optional check.
+		if er, ok := target.(targetErrReporter); ok {
+			if rerr := er.Err(); rerr != nil {
+				_ = in.Emit(in.RunID, "proxy", "policy.silence", map[string]interface{}{
+					"reason": "stream read error", "stream": "targetStdout", "error": rerr.Error(),
+				})
+				targetToClientDone <- fmt.Errorf("proxy: reading from target: %w", rerr)
+				return
+			}
 		}
 		targetToClientDone <- nil
 	}()
 
-	waitErr := cmd.Wait()
+	waitErr := target.Stop()
 
-	// The target has exited, which closes targetStdout and makes the
-	// target -> client goroutine's ReadFrames loop end shortly — but
-	// "shortly" is not "already", and that goroutine is the only other
-	// writer to clientOut. Run must not return (and the caller must not
+	// The target has exited, which closes its Receive channel and makes
+	// the target -> client goroutine's loop end shortly — but "shortly"
+	// is not "already", and that goroutine is the only other writer to
+	// clientOut. RunTarget must not return (and the caller must not
 	// treat clientOut as final) until it actually has. This is a real
 	// fix, not a defensive guess: without this blocking receive, a
-	// caller (or a test) reading clientOut right after Run returns can
-	// race the final in-flight WriteFrame — see the race this closes in
-	// proxy_test.go.
+	// caller (or a test) reading clientOut right after RunTarget returns
+	// can race the final in-flight WriteFrame — see the race this closes
+	// in proxy_test.go.
 	drainErr := <-targetToClientDone
 	if drainErr != nil {
 		return drainErr
@@ -164,7 +212,7 @@ func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer
 
 	// Symmetric to the drain above, but for mcp_call_timeout_seconds:
 	// every timer armTimeout started must be accounted for — fired, or
-	// canceled by a real response — before Run treats clientOut as
+	// canceled by a real response — before RunTarget treats clientOut as
 	// final. This returns immediately once that's true; it does not
 	// wait out the full timeout duration for calls that already
 	// resolved normally (see Interceptor.resolvePending's Stop() path).
