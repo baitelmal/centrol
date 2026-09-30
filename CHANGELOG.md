@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.1.1 — 2026-09-30
+
+Bug fix release. No new features, no config or CLI changes.
+
+### Fixed
+
+- `centrol proxy` no longer forwards a non-JSON line on the target
+  server's stdout to the client. Previously it was correctly logged as
+  `policy.silence` but the raw bytes were still written through to the
+  client's stdout, breaking the "client-facing stdout carries nothing
+  but JSON-RPC frames" guarantee the proxy exists to hold. This is
+  common in practice, not a corner case: any Node MCP server that
+  writes a startup banner or `console.log` line to stdout instead of
+  stderr — the default, easy mistake for a quick, third-party server —
+  would corrupt the agent harness's JSON-RPC parser on first run,
+  reading as "the agent stopped working." Now logged as
+  `policy.silence` and dropped, matching how a malformed frame from
+  the client was already handled.
+
 ## v0.1.0 — 2026-09-29
 
 First release. Centrol wraps coding agents with an accountability layer:
