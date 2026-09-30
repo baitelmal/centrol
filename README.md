@@ -10,6 +10,23 @@ Within those, it blocks what violates policy and gives you an
 append-only, hash-chained record of everything else, so you can review
 it, verify it hasn't been tampered with, and roll it back.
 
+## See it in action
+
+`centrol proxy` hard-blocking a tool call that reaches for a credential
+path, before it ever touches the target MCP server:
+
+![centrol proxy blocking a credential-path call](docs/images/proxy-block.png)
+
+`centrol guard` wrapping a run — snapshot first, then every filesystem
+write logged as it happens:
+
+![centrol guard logging a run's filesystem writes](docs/images/guard-run.png)
+
+`centrol audit` — the combined ledger, allowed and blocked events side
+by side:
+
+![centrol audit combined ledger view](docs/images/audit-ledger.png)
+
 ## Install
 
 Single static binary, no dependencies. Downloads the release asset for
