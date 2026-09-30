@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os/exec"
@@ -934,5 +935,173 @@ func TestOutOfScopeDenialSuggestionDoesNotMentionCentrolScope(t *testing.T) {
 	suggestion, _ := data["suggestion"].(string)
 	if strings.Contains(suggestion, "centrol scope") {
 		t.Fatalf("suggestion still tells the agent to run `centrol scope`, which has no effect on a running proxy: %q", suggestion)
+	}
+}
+
+// --- Pre-Pass-2 check: RunTarget's optional-capability degrade path
+// (targetInputCloser / targetErrReporter) must not silently skip a
+// transport.Target that implements only the four required methods —
+// it must drive it correctly and report the missing capability on
+// diagOut, never panic, and never skip the mandatory shutdown step
+// (target.Stop()). ---
+
+// minimalTarget implements exactly transport.Target's four required
+// methods (Start, Send, Receive, Stop) — deliberately no Err() and no
+// CloseInput() — so it can never satisfy targetInputCloser or
+// targetErrReporter. It answers exactly one request: Send echoes back
+// a canned result for whatever id it was given and then closes its
+// receive channel, so the target -> client pump ends deterministically
+// without depending on when RunTarget happens to call Stop().
+type minimalTarget struct {
+	mu      sync.Mutex
+	ch      chan []byte
+	started bool
+	stopped bool
+}
+
+func newMinimalTarget() *minimalTarget {
+	return &minimalTarget{ch: make(chan []byte, 4)}
+}
+
+func (m *minimalTarget) Start(ctx context.Context) error {
+	m.mu.Lock()
+	m.started = true
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *minimalTarget) Send(frame []byte) error {
+	var env map[string]interface{}
+	if err := json.Unmarshal(frame, &env); err != nil {
+		return err
+	}
+	resp, err := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": env["id"], "result": map[string]interface{}{"ok": true},
+	})
+	if err != nil {
+		return err
+	}
+	m.ch <- resp
+	close(m.ch)
+	return nil
+}
+
+func (m *minimalTarget) Receive() (<-chan []byte, error) {
+	return m.ch, nil
+}
+
+func (m *minimalTarget) Stop() error {
+	m.mu.Lock()
+	m.stopped = true
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *minimalTarget) wasStarted() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.started
+}
+
+func (m *minimalTarget) wasStopped() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stopped
+}
+
+// safeBuffer is a bytes.Buffer with its own lock, for a test where more
+// than one goroutine writes to the same sink concurrently (here:
+// RunTarget's two pump goroutines can both write a capability-degrade
+// debug note to diagOut). RunTarget itself serializes those writes
+// with its own internal mutex, but that only protects diagOut's
+// *contents* from interleaving — a plain bytes.Buffer read from the
+// test goroutine while a pump goroutine might still be writing is a
+// separate, textbook data race on the Buffer's own fields, which this
+// avoids.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestRunTargetDrivesMinimalTargetWithoutOptionalCapabilities(t *testing.T) {
+	rec := &recorder{}
+	in := NewInterceptor("run-1", testContract(), rec.emit, nil, true)
+
+	mt := newMinimalTarget()
+	line := toolCallLine(t, "1", "read_file", map[string]interface{}{"path": "a.go"})
+	clientIn := strings.NewReader(string(line) + "\n")
+	clientOut := &safeBuffer{}
+	diag := &safeBuffer{}
+
+	var runErr error
+	done := make(chan struct{})
+	go func() {
+		runErr = RunTarget(mt, in, clientIn, clientOut, diag)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunTarget did not return against a minimal Target — likely deadlocked on a missing optional capability")
+	}
+
+	if runErr != nil {
+		t.Fatalf("expected RunTarget to complete without error against a minimal Target, got: %v", runErr)
+	}
+
+	if !mt.wasStarted() {
+		t.Fatalf("expected target.Start() to have been called")
+	}
+	if !mt.wasStopped() {
+		t.Fatalf("expected target.Stop() to have been called — shutdown cleanup must not be skipped just because optional capabilities are absent")
+	}
+
+	out := strings.TrimSpace(clientOut.String())
+	var resp map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &resp); err != nil {
+		t.Fatalf("client stdout did not contain the forwarded response: %q (%v)", out, err)
+	}
+	if resp["id"] != "1" {
+		t.Fatalf("expected response id=1, got %v", resp["id"])
+	}
+
+	// The degrade path must not be silent-skip: RunTarget notes the
+	// missing capability on diagOut (never on clientOut — STDIO
+	// DISCIPLINE still applies). The targetErrReporter note is written
+	// by the target -> client pump, which RunTarget's return already
+	// waits on (via targetToClientDone) — it's present the instant
+	// RunTarget returns. The targetInputCloser note, though, is written
+	// by the client -> target pump, and RunTarget deliberately does NOT
+	// wait for that pump before returning (a live client's stdin may
+	// stay open long after the target exits — see the non-blocking
+	// select at the end of RunTarget), so here it can trail RunTarget's
+	// return by a scheduling instant even though clientIn already hit
+	// EOF. Poll briefly for it rather than asserting it's there the
+	// instant we wake up.
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(diag.String(), "targetInputCloser") {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected a debug note about the missing targetInputCloser capability on diagOut, got: %q", diag.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !strings.Contains(diag.String(), "targetErrReporter") {
+		t.Fatalf("expected a debug note about the missing targetErrReporter capability on diagOut, got: %q", diag.String())
+	}
+	if strings.Contains(clientOut.String(), "debug:") {
+		t.Fatalf("the capability-degrade debug note leaked onto clientOut, violating STDIO DISCIPLINE: %q", clientOut.String())
 	}
 }

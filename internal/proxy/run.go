@@ -64,8 +64,6 @@ type targetInputCloser interface {
 // WriteFrame. Every other message (errors, the FLAG UI) goes to
 // diagOut (stderr) or the controlling TTY, never here.
 func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer, diagOut io.Writer) error {
-	_ = diagOut // kept for signature symmetry with Run/StderrPrompt; the transport itself owns where its own stderr goes (see transport.NewStdioTarget)
-
 	if err := target.Start(context.Background()); err != nil {
 		return err
 	}
@@ -73,6 +71,7 @@ func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, cli
 	clientToTargetErr := make(chan error, 1)
 	targetToClientDone := make(chan error, 1) // this is the goroutine that writes to clientOut — RunTarget must not return until it has actually finished
 	var clientOutMu sync.Mutex                // WriteFrame calls interleave from both pump directions; guard the shared writer so frames never partially interleave on the wire.
+	var diagOutMu sync.Mutex                  // the capability-degrade debug notes below can fire from either pump goroutine; guard diagOut the same way clientOutMu guards clientOut.
 
 	// Interceptor itself never touches clientOut (its job is evaluation
 	// and logging, not I/O) — so RunTarget supplies the one callback
@@ -104,6 +103,10 @@ func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, cli
 		defer func() {
 			if ic, ok := target.(targetInputCloser); ok {
 				_ = ic.CloseInput()
+			} else {
+				diagOutMu.Lock()
+				fmt.Fprintf(diagOut, "centrol: debug: target does not implement targetInputCloser — no stdin-close notification to send, by design for this transport\n")
+				diagOutMu.Unlock()
 			}
 		}()
 		clientLines, clientReadErr := ReadFrames(clientIn)
@@ -190,6 +193,10 @@ func RunTarget(target transport.Target, in *Interceptor, clientIn io.Reader, cli
 				targetToClientDone <- fmt.Errorf("proxy: reading from target: %w", rerr)
 				return
 			}
+		} else {
+			diagOutMu.Lock()
+			fmt.Fprintf(diagOut, "centrol: debug: target does not implement targetErrReporter — cannot distinguish a clean stream end from a read failure for this transport\n")
+			diagOutMu.Unlock()
 		}
 		targetToClientDone <- nil
 	}()
