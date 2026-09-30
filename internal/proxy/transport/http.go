@@ -107,22 +107,32 @@ func (t *HTTPTarget) Start(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	t.ctx = ctx
-	if t.recvCh == nil {
-		t.recvCh = make(chan []byte)
-	}
+	t.ensureRecvCh()
 	return nil
 }
 
 // Receive returns the channel Send delivers response frames onto.
-// Safe to call more than once; the channel is created once (in Start,
-// or lazily here if Receive is somehow called first) and reused.
+// Safe to call more than once, including after Stop: recvCh is
+// allocated once (in Start, or lazily here if Receive is somehow
+// called first) and is never replaced or nilled out, so a Receive
+// call that races with or follows Stop still gets the same channel
+// Stop closed — a `for range` over it exits immediately instead of
+// blocking on a fresh, orphaned channel nothing will ever close.
 func (t *HTTPTarget) Receive() (<-chan []byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.ensureRecvCh()
+	return t.recvCh, nil
+}
+
+// ensureRecvCh lazily allocates recvCh exactly once. Callers must
+// hold t.mu. recvCh, once allocated, is never set back to nil —
+// see Stop and deliver for why that invariant is what makes this
+// type's shutdown safe.
+func (t *HTTPTarget) ensureRecvCh() {
 	if t.recvCh == nil {
 		t.recvCh = make(chan []byte)
 	}
-	return t.recvCh, nil
 }
 
 // Send POSTs frame to URL and forwards whatever response frame(s) it
@@ -255,15 +265,30 @@ func (t *HTTPTarget) deliverSSE(body io.Reader) error {
 // deliver copies frame and sends it on the receive channel. Copying
 // matches StdioTarget/proxy.ReadFrames's own convention of never
 // handing out a slice a caller might still be reusing.
+//
+// deliver holds t.mu across the send itself, not just the channel
+// lookup, so the "is t.stopped" check and the send are atomic with
+// respect to Stop's own "set stopped, then close" critical section:
+// either deliver fully completes its send before Stop closes the
+// channel, or Stop's close is visible to deliver before it would
+// send, and deliver skips the frame instead of sending on (or
+// panicking on) a closed channel. Holding the mutex across the send
+// cannot deadlock here: nothing on the receiving end (the target
+// pump's plain `for range` in proxy.RunTarget) ever calls back into
+// HTTPTarget or needs t.mu itself.
 func (t *HTTPTarget) deliver(frame []byte) {
 	cp := make([]byte, len(frame))
 	copy(cp, frame)
 	t.mu.Lock()
-	ch := t.recvCh
-	t.mu.Unlock()
-	if ch != nil {
-		ch <- cp
+	defer t.mu.Unlock()
+	if t.stopped {
+		// Stop has already closed recvCh (or is about to, under this
+		// same lock); nothing is listening anymore, and sending here
+		// would panic on a closed channel. Drop the frame.
+		return
 	}
+	t.ensureRecvCh()
+	t.recvCh <- cp
 }
 
 // Stop sends a best-effort DELETE to terminate the session, if one
@@ -273,6 +298,15 @@ func (t *HTTPTarget) deliver(frame []byte) {
 // than one place as a shutdown-signal fallback, and a second call
 // here is a no-op rather than a duplicate DELETE or a double-close of
 // the receive channel.
+//
+// Stop never sets recvCh back to nil. The old behavior did, so that
+// a Receive call racing with (or arriving after) Stop would silently
+// allocate a fresh channel nothing would ever write to or close,
+// hanging any `for range` over it forever. recvCh is allocated once
+// and kept for the HTTPTarget's lifetime; stopped (checked and set
+// under the same mutex as deliver's send) is the single source of
+// truth for whether the channel has been closed, which is what makes
+// the close here race-free against deliver.
 func (t *HTTPTarget) Stop() error {
 	t.mu.Lock()
 	if t.stopped {
@@ -281,8 +315,8 @@ func (t *HTTPTarget) Stop() error {
 	}
 	t.stopped = true
 	sid := t.SessionID
+	t.ensureRecvCh()
 	ch := t.recvCh
-	t.recvCh = nil
 	t.mu.Unlock()
 
 	if sid != "" {
@@ -295,9 +329,7 @@ func (t *HTTPTarget) Stop() error {
 		}
 	}
 
-	if ch != nil {
-		close(ch)
-	}
+	close(ch)
 	return nil
 }
 

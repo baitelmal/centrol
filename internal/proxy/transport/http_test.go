@@ -456,6 +456,38 @@ func TestHTTPTargetDoesNotRetryNonDialErrors(t *testing.T) {
 	}
 }
 
+// TestHTTPTargetReceiveAfterStopDoesNotHang guards against a
+// regression of a race where Stop nilled recvCh after closing it: a
+// Receive call arriving concurrently with, or after, Stop could then
+// lazily allocate a brand-new channel nothing would ever write to or
+// close, hanging any `for range` over it forever (the proxy's target
+// pump does exactly that). recvCh must now be allocated once and
+// never nilled, so Receive after Stop always returns the same,
+// already-closed channel and a range over it exits immediately.
+func TestHTTPTargetReceiveAfterStopDoesNotHang(t *testing.T) {
+	target := &HTTPTarget{URL: "http://example.invalid/mcp"}
+	if err := target.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := target.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	ch, err := target.Receive()
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("expected a closed channel (no frame), got an open one with a value")
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Receive after Stop hung — race not fixed")
+	}
+}
+
 func TestHTTPTargetDoesNotRetryAfterAResponseWasReceived(t *testing.T) {
 	// A 500 means the request definitely reached the server and was
 	// processed (however badly) — retrying could double-fire whatever
