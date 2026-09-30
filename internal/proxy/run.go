@@ -66,7 +66,8 @@ func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer
 	// client -> target
 	go func() {
 		defer targetStdin.Close()
-		for line := range ReadFrames(clientIn) {
+		clientLines, clientReadErr := ReadFrames(clientIn)
+		for line := range clientLines {
 			forward, fwdLine, blockResp, err := in.HandleClientRequest(line)
 			if err != nil {
 				clientToTargetErr <- fmt.Errorf("proxy: handling client request: %w", err)
@@ -89,12 +90,27 @@ func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer
 				}
 			}
 		}
+		// The channel is closed either because clientIn was exhausted
+		// cleanly (normal EOF — e.g. the client hung up) or because the
+		// scanner itself failed (oversized frame, read error). Only the
+		// latter is a real failure: it means bytes on the wire were lost
+		// without ever being evaluated or forwarded, which is exactly
+		// what Protocol Silence exists to make visible rather than let
+		// pass as an ordinary clean close.
+		if rerr := clientReadErr(); rerr != nil {
+			_ = in.Emit(in.RunID, "proxy", "policy.silence", map[string]interface{}{
+				"reason": "stream read error", "stream": "clientIn", "error": rerr.Error(),
+			})
+			clientToTargetErr <- fmt.Errorf("proxy: reading from client: %w", rerr)
+			return
+		}
 		clientToTargetErr <- nil
 	}()
 
 	// target -> client
 	go func() {
-		for line := range ReadFrames(targetStdout) {
+		targetLines, targetReadErr := ReadFrames(targetStdout)
+		for line := range targetLines {
 			fwdLine, err := in.HandleTargetResponse(line)
 			if err != nil {
 				targetToClientDone <- fmt.Errorf("proxy: handling target response: %w", err)
@@ -115,6 +131,17 @@ func Run(target Target, in *Interceptor, clientIn io.Reader, clientOut io.Writer
 				targetToClientDone <- fmt.Errorf("proxy: writing to client: %w", werr)
 				return
 			}
+		}
+		// Same distinction as the client -> target pump above: a clean
+		// close here is the target exiting normally (the expected,
+		// common case handled below via cmd.Wait()); a non-nil error
+		// means the target's stdout stream itself failed mid-read.
+		if rerr := targetReadErr(); rerr != nil {
+			_ = in.Emit(in.RunID, "proxy", "policy.silence", map[string]interface{}{
+				"reason": "stream read error", "stream": "targetStdout", "error": rerr.Error(),
+			})
+			targetToClientDone <- fmt.Errorf("proxy: reading from target: %w", rerr)
+			return
 		}
 		targetToClientDone <- nil
 	}()

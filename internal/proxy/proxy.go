@@ -14,7 +14,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -64,13 +67,27 @@ type toolCallParams struct {
 	Arguments map[string]interface{} `json:"arguments"`
 }
 
+// ErrStreamRead marks a ReadFrames failure as a genuine I/O/scan error
+// (a read failure, or a line exceeding the scanner's buffer cap) rather
+// than the stream simply running out — callers use errors.Is against
+// this to tell "the process exited/pipe closed" apart from "something
+// went wrong while reading," which the run summary surfaces as a
+// distinct "stream error" condition.
+var ErrStreamRead = errors.New("proxy: stream read error")
+
 // ReadFrames reads newline-delimited JSON-RPC messages from r and sends
 // each raw line (without its trailing newline) on the returned channel,
-// which is closed when r is exhausted or errors.
-func ReadFrames(r io.Reader) <-chan []byte {
-	out := make(chan []byte)
+// which is closed when r is exhausted or errors. The returned errFn must
+// be called only after the channel has been fully drained (ranged over
+// to completion); it then reports nil for a clean EOF, or an error
+// wrapping ErrStreamRead for a real scan failure (bufio.Scanner.Err()),
+// so callers can distinguish the two instead of treating every channel
+// close as "the stream ended cleanly."
+func ReadFrames(r io.Reader) (out <-chan []byte, errFn func() error) {
+	ch := make(chan []byte)
+	var scanErr error
 	go func() {
-		defer close(out)
+		defer close(ch)
 		scanner := bufio.NewScanner(r)
 		scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 		for scanner.Scan() {
@@ -80,10 +97,27 @@ func ReadFrames(r io.Reader) <-chan []byte {
 			}
 			cp := make([]byte, len(line))
 			copy(cp, line)
-			out <- cp
+			ch <- cp
+		}
+		if err := scanner.Err(); err != nil && !errors.Is(err, os.ErrClosed) {
+			// os.ErrClosed specifically means the underlying *os.File was
+			// closed out from under this read — which is exactly what
+			// happens, by design, when r is an exec.Cmd's StdoutPipe and
+			// the caller's cmd.Wait() has already seen the child exit:
+			// per os/exec's own documented contract, "Wait will close
+			// the pipe after seeing the command exit." That's the target
+			// process ending normally, observed as a close-during-read
+			// race instead of a tidy EOF — not a real transport failure,
+			// and not data loss, so it must not be reported as one.
+			scanErr = err
 		}
 	}()
-	return out
+	return ch, func() error {
+		if scanErr == nil {
+			return nil
+		}
+		return fmt.Errorf("%w: %v", ErrStreamRead, scanErr)
+	}
 }
 
 // WriteFrame writes exactly one JSON-RPC frame plus a trailing newline.
@@ -199,6 +233,9 @@ func (in *Interceptor) armTimeout(id json.RawMessage, tool string) {
 			return
 		}
 		delete(in.pendingCalls, key)
+		if in.timedOutIDs == nil {
+			in.timedOutIDs = map[string]bool{}
+		}
 		in.timedOutIDs[key] = true
 		in.pendingMu.Unlock()
 
@@ -539,7 +576,12 @@ func denialSuggestion(reason string) string {
 	case "credential_path":
 		return "this path holds credentials or system files and is never reachable; do not retry it"
 	default:
-		return "this action is outside the current contract; use `centrol scope +<path>` to widen it, or ask the operator"
+		// NOTE: unlike centrol guard, a running centrol proxy does not
+		// re-consult live `centrol scope` amendments (see the comment on
+		// Interceptor construction in cmd/centrol/cmd_proxy.go), so this
+		// hint must not tell the agent/operator that `centrol scope` will
+		// change anything for the current run.
+		return "out_of_scope: the path is outside the contract scope. Restart the run with a wider --scope, or contact the operator to adjust policy."
 	}
 }
 

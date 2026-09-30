@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"strings"
 	"sync"
@@ -782,4 +783,156 @@ func TestShipCriterion15_PolicyDenialsAreStructuredNotSilent(t *testing.T) {
 			t.Fatalf("expected the next call to succeed after a prompt timeout")
 		}
 	})
+}
+
+// --- Pass 0.5a: ReadFrames must distinguish a real scan/read failure
+// from an ordinary clean EOF. ---
+
+// flakyReader serves data first, then fails every subsequent Read with
+// err (which must not be io.EOF, or bufio.Scanner would treat it as a
+// clean end rather than a real error).
+type flakyReader struct {
+	data []byte
+	err  error
+}
+
+func (f *flakyReader) Read(p []byte) (int, error) {
+	if len(f.data) > 0 {
+		n := copy(p, f.data)
+		f.data = f.data[n:]
+		return n, nil
+	}
+	return 0, f.err
+}
+
+func TestReadFramesCleanEOFReportsNoError(t *testing.T) {
+	r := strings.NewReader(`{"jsonrpc":"2.0","id":"1","method":"ping"}` + "\n")
+	lines, errFn := ReadFrames(r)
+
+	var got [][]byte
+	for line := range lines {
+		got = append(got, line)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 line, got %d", len(got))
+	}
+	if err := errFn(); err != nil {
+		t.Fatalf("expected nil error after a clean EOF, got: %v", err)
+	}
+}
+
+func TestReadFramesScanErrorIsReportedAsErrStreamRead(t *testing.T) {
+	boom := errors.New("boom: pipe went away")
+	r := &flakyReader{
+		data: []byte(`{"jsonrpc":"2.0","id":"1","method":"ping"}` + "\n"),
+		err:  boom,
+	}
+	lines, errFn := ReadFrames(r)
+
+	var got [][]byte
+	for line := range lines {
+		got = append(got, line)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected the one line sent before the failure, got %d", len(got))
+	}
+
+	err := errFn()
+	if err == nil {
+		t.Fatalf("expected a non-nil error after a real read failure, got nil")
+	}
+	if !errors.Is(err, ErrStreamRead) {
+		t.Fatalf("expected errors.Is(err, ErrStreamRead) to hold, got: %v", err)
+	}
+}
+
+// TestClientStreamReadErrorIsSilencedAndSurfaced exercises the failure
+// through the real client -> target pump (not just ReadFrames in
+// isolation): a clientIn whose Read fails mid-stream (not a clean EOF)
+// must produce a policy.silence entry naming the clientIn stream, as
+// opposed to a stream that simply closes normally, which must not.
+func TestClientStreamReadErrorIsSilencedAndSurfaced(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available in this environment")
+	}
+	rec := &recorder{}
+	in := NewInterceptor("run-1", testContract(), rec.emit, nil, true)
+
+	script := `while IFS= read -r line; do echo '{"jsonrpc":"2.0","id":"1","result":{"ok":true}}'; done`
+	line := toolCallLine(t, "1", "read_file", map[string]interface{}{"path": "a.go"})
+	clientIn := &flakyReader{data: []byte(string(line) + "\n"), err: errors.New("boom: client pipe broke")}
+
+	var clientOut, diag bytes.Buffer
+	runErr := Run(Target{Command: "sh", Args: []string{"-c", script}}, in, clientIn, &clientOut, &diag)
+
+	if !errors.Is(runErr, ErrStreamRead) {
+		t.Fatalf("expected Run to return an error wrapping ErrStreamRead, got: %v", runErr)
+	}
+
+	rec.mu.Lock()
+	var found bool
+	for i, typ := range rec.types {
+		if typ == "policy.silence" && rec.entries[i]["stream"] == "clientIn" {
+			found = true
+		}
+	}
+	rec.mu.Unlock()
+	if !found {
+		t.Fatalf("expected a policy.silence entry for stream=clientIn, got types=%v", rec.types)
+	}
+}
+
+// TestCleanClientEOFProducesNoStreamErrorSilence is the negative control
+// for TestClientStreamReadErrorIsSilencedAndSurfaced: an ordinary client
+// hangup (clean EOF, the common case — e.g. the harness closing stdin)
+// must NOT be recorded as a stream read error, and Run must not report
+// one.
+func TestCleanClientEOFProducesNoStreamErrorSilence(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available in this environment")
+	}
+	rec := &recorder{}
+	in := NewInterceptor("run-1", testContract(), rec.emit, nil, true)
+
+	script := `while IFS= read -r line; do echo '{"jsonrpc":"2.0","id":"1","result":{"ok":true}}'; done`
+	line := toolCallLine(t, "1", "read_file", map[string]interface{}{"path": "a.go"})
+	clientIn := strings.NewReader(string(line) + "\n")
+
+	var clientOut, diag bytes.Buffer
+	runErr := Run(Target{Command: "sh", Args: []string{"-c", script}}, in, clientIn, &clientOut, &diag)
+	if runErr != nil {
+		t.Fatalf("expected a clean EOF to produce no error, got: %v", runErr)
+	}
+
+	rec.mu.Lock()
+	for i, typ := range rec.types {
+		if typ == "policy.silence" && rec.entries[i]["reason"] == "stream read error" {
+			t.Fatalf("did not expect a stream-read-error policy.silence entry for a clean EOF")
+		}
+	}
+	rec.mu.Unlock()
+}
+
+// --- Pass 0.5b: the out_of_scope denial hint must not tell the agent
+// that `centrol scope` will change anything for a running proxy (it
+// doesn't — see the Interceptor construction comment in
+// cmd/centrol/cmd_proxy.go). ---
+func TestOutOfScopeDenialSuggestionDoesNotMentionCentrolScope(t *testing.T) {
+	rec := &recorder{}
+	c := policy.Contract{Kind: policy.KindProxy, TaskID: "run-1", RepoRoot: "/repo", AllowedPaths: []string{"src"}, MassMutationThreshold: 20}
+	in := NewInterceptor("run-1", c, rec.emit, nil, true)
+	line := toolCallLine(t, "1", "write_file", map[string]interface{}{"path": "../outside/evil.go"})
+	forward, _, block, err := in.HandleClientRequest(line)
+	if err != nil || forward || block == nil {
+		t.Fatalf("expected an out-of-scope path to be denied")
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(block, &resp); err != nil {
+		t.Fatalf("denial response not valid JSON-RPC: %v", err)
+	}
+	data := resp["error"].(map[string]interface{})["data"].(map[string]interface{})
+	suggestion, _ := data["suggestion"].(string)
+	if strings.Contains(suggestion, "centrol scope") {
+		t.Fatalf("suggestion still tells the agent to run `centrol scope`, which has no effect on a running proxy: %q", suggestion)
+	}
 }

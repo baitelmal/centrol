@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -258,6 +259,17 @@ func cmdProxyRun(args []string) {
 	// amendments within the same run in v0.1. Widening this to consult
 	// gc live is a small follow-up, not a redesign: EvaluateToolCall's
 	// signature already takes a Contract by value.
+	//
+	// This is an asymmetry with `centrol guard`: guard's watcher path
+	// evaluates through contractAwareEmit (contract_runtime.go), which
+	// calls gc.get() fresh on every fs event, so a mid-run `centrol
+	// scope +<path>` takes effect immediately there. proxy's Interceptor
+	// has no equivalent — it only ever sees the Contract value handed to
+	// NewInterceptor below, so the same scope amendment is silently
+	// inert for tools/call policy decisions in this run. See
+	// internal/proxy/proxy.go's denialSuggestion, which is worded to not
+	// imply otherwise. Fixing this (making Interceptor consult gc live,
+	// the same way guard does) is a v0.2.x follow-up, not done here.
 
 	// Unlike centrol guard (which hands signal responsibility to
 	// terminal.Run's own forwarding once the wrapped agent starts),
@@ -271,6 +283,9 @@ func cmdProxyRun(args []string) {
 	endPayload := map[string]interface{}{}
 	if runErr != nil {
 		endPayload["error"] = runErr.Error()
+	}
+	if errors.Is(runErr, proxy.ErrStreamRead) {
+		counters.markStreamError()
 	}
 	_ = emit(runID, "proxy", "run.end", endPayload)
 	clearMarker()

@@ -22,9 +22,20 @@ import (
 type runCounters struct {
 	mu                      sync.Mutex
 	total, flagged, blocked int
+	streamErr               bool // set via markStreamError when a pump's underlying I/O read failed (see proxy.ErrStreamRead), as opposed to an ordinary clean stream close
 }
 
 func newRunCounters() *runCounters { return &runCounters{} }
+
+// markStreamError records that this run ended (at least in part) because
+// a pump's read failed rather than the stream simply closing cleanly —
+// printRunSummary surfaces this distinctly so it isn't mistaken for an
+// ordinary completed run.
+func (c *runCounters) markStreamError() {
+	c.mu.Lock()
+	c.streamErr = true
+	c.mu.Unlock()
+}
 
 // wrap returns an EmitFunc-shaped function that tallies every emission
 // through inner before forwarding to it — counting happens regardless
@@ -49,6 +60,12 @@ func (c *runCounters) snapshot() (total, flagged, blocked int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.total, c.flagged, c.blocked
+}
+
+func (c *runCounters) hadStreamError() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.streamErr
 }
 
 // formatRunDuration renders a duration the way the summary block wants
@@ -93,6 +110,10 @@ func printRunSummary(w io.Writer, runID, ledgerFile string, started time.Time, c
 		fmt.Fprintf(w, "  Events:   %d logged, %d flagged, %d blocked\n", total, flagged, blocked)
 	}
 	fmt.Fprintf(w, "  Ledger:   %s\n", ledgerFile)
+	if counters.hadStreamError() {
+		warn := p.Yellow(ui.Glyph(w, ui.GlyphWarn))
+		fmt.Fprintf(w, "  %s stream error — a pump's underlying read failed; see the ledger's policy.silence entry for details\n", warn)
+	}
 
 	inspectFlags := ""
 	switch {
