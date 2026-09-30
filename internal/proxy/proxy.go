@@ -417,10 +417,21 @@ func (in *Interceptor) HandleClientRequest(line []byte) (forward bool, forwardLi
 func (in *Interceptor) HandleTargetResponse(line []byte) (forwardLine []byte, err error) {
 	var env rpcEnvelope
 	if err := json.Unmarshal(line, &env); err != nil {
+		// STDIO DISCIPLINE (see package doc) is non-negotiable: the
+		// client-facing stdout stream carries nothing but JSON-RPC
+		// frames, full stop. A misbehaving target (a Node server's
+		// console.log leaking onto its own stdout instead of stderr,
+		// a startup banner, a stray debug print) is common enough in
+		// the wild that this is not a hypothetical — forwarding that
+		// raw text to the client would corrupt its JSON-RPC parser,
+		// the exact failure this proxy exists to prevent. Record it
+		// fully inward via policy.silence and drop it, matching
+		// HandleClientRequest's handling of an unparseable client
+		// frame: log-and-continue, never forward.
 		_ = in.Emit(in.RunID, "proxy", "policy.silence", map[string]interface{}{
 			"reason": "unparseable target frame", "raw": string(line),
 		})
-		return line, nil // still forward: a malformed frame from the *target* is not the agent's fault to lose
+		return nil, nil
 	}
 	if env.Result != nil || env.Error != nil {
 		if in.resolvePending(env.ID) {

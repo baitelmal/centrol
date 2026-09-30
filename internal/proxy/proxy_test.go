@@ -496,6 +496,58 @@ func TestMalformedClientFrameDoesNotCrashAndIsSilenced(t *testing.T) {
 	}
 }
 
+// TestNonJSONLineOnTargetStdoutIsSilencedNotForwarded is the
+// target-side mirror of TestMalformedClientFrameDoesNotCrashAndIsSilenced:
+// a real-world MCP server (in particular a Node one) can leak a
+// console.log or startup banner onto its own stdout instead of stderr.
+// STDIO DISCIPLINE (see the package doc) makes the client-facing
+// stdout stream JSON-RPC-only, non-negotiably, so that leak must be
+// recorded as policy.silence and dropped — never forwarded to the
+// client, where it would corrupt the agent harness's JSON-RPC parser —
+// and it must not crash or hang the proxy, with the real response
+// around it still delivered.
+func TestNonJSONLineOnTargetStdoutIsSilencedNotForwarded(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available in this environment")
+	}
+	rec := &recorder{}
+	in := NewInterceptor("run-1", testContract(), rec.emit, nil, true)
+
+	// target's stdout: a console.log leak, then its real JSON-RPC response
+	script := `
+echo "Server listening on stdio"
+while IFS= read -r line; do
+  echo '{"jsonrpc":"2.0","id":"1","result":{"ok":true}}'
+done
+`
+	line := toolCallLine(t, "1", "read_file", map[string]interface{}{"path": "a.go"})
+	var clientOut, diag bytes.Buffer
+	clientIn := strings.NewReader(string(line) + "\n")
+
+	if err := Run(Target{Command: "sh", Args: []string{"-c", script}}, in, clientIn, &clientOut, &diag); err != nil {
+		t.Fatalf("Run should not crash or error on a non-JSON target stdout line, got: %v", err)
+	}
+
+	if !rec.has("policy.silence") {
+		t.Fatalf("expected the leaked line to be recorded as policy.silence, got %v", rec.types)
+	}
+
+	outLines := strings.Split(strings.TrimSpace(clientOut.String()), "\n")
+	var nonEmpty []string
+	for _, l := range outLines {
+		if strings.TrimSpace(l) != "" {
+			nonEmpty = append(nonEmpty, l)
+		}
+	}
+	if len(nonEmpty) != 1 {
+		t.Fatalf("expected exactly 1 response on client stdout (the leaked line dropped, not forwarded), got %d: %v", len(nonEmpty), nonEmpty)
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal([]byte(nonEmpty[0]), &v); err != nil {
+		t.Fatalf("client stdout contained a non-JSON-RPC line (STDIO DISCIPLINE violated): %q", nonEmpty[0])
+	}
+}
+
 // TestStdoutCleanlinessCheckHasTeeth is a negative control for
 // TestDiagnosticsNeverReachClientStdout: it proves the "every stdout
 // line must parse as JSON-RPC" assertion actually fails when
