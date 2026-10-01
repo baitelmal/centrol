@@ -319,6 +319,20 @@ func cmdProxyRun(args []string) {
 			case <-ticker.C:
 				reqs, newOffset, err := session.PollScopeRequests(centrolDir(root), offset)
 				if err != nil {
+					// Audit fix (3b): this used to discard the error
+					// outright. It's not a stop condition — the scope
+					// poller is a convenience, and a transient read error
+					// (e.g. a concurrent writer mid-append) will usually
+					// clear on the next tick — but a silent, permanent
+					// failure here means `centrol scope +path` stops
+					// working with no indication why, so it goes to the
+					// ledger (policy.silence, same tier a malformed
+					// target frame gets) and a debug-level stderr line,
+					// then the loop just tries again next tick.
+					logger.Debugf("centrol proxy: scope-request poll failed: %v\n", err)
+					_ = emit(runID, "proxy", "policy.silence", map[string]interface{}{
+						"reason": "scope-request poll failed", "error": err.Error(),
+					})
 					continue
 				}
 				offset = newOffset

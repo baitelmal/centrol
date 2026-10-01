@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1281,5 +1282,57 @@ func TestProxyTargetFlagOverridesConfiguredTargetURL(t *testing.T) {
 	_, stderr, _ := centrol(t, dir, "proxy", "--target", "cat")
 	if !strings.Contains(stderr, "Run complete") {
 		t.Fatalf("expected --target to override the configured target_url and run against stdio cleanly, got stderr:\n%s", stderr)
+	}
+}
+
+// TestProxyLogsScopePollErrorsInsteadOfSwallowing is the audit's 3b
+// fix: the live-scope poller's read error used to be discarded
+// outright (`continue` with nothing logged). Forces a real,
+// non-IsNotExist read error by making scope-requests.jsonl a
+// directory instead of a file, keeps the proxy running across several
+// 200ms poll ticks via an open stdin pipe, and confirms the error
+// reaches the ledger as policy.silence rather than vanishing — and
+// that the run completes normally despite it (not a stop condition).
+func TestProxyLogsScopePollErrorsInsteadOfSwallowing(t *testing.T) {
+	dir := initTestRepo(t)
+	centrolPath := filepath.Join(dir, ".centrol")
+	if err := os.MkdirAll(filepath.Join(centrolPath, "scope-requests.jsonl"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	pr, pw := io.Pipe()
+	cmd := exec.Command(binPath, "proxy", "--target", "cat")
+	cmd.Dir = dir
+	cmd.Stdin = pr
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting proxy: %v", err)
+	}
+
+	// Several poll ticks (200ms interval) before letting the run end.
+	time.Sleep(700 * time.Millisecond)
+	pw.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		cmd.Process.Kill()
+		t.Fatalf("proxy timed out; stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Run complete") {
+		t.Fatalf("expected the run to complete normally despite the poll error (not a stop condition), got stderr:\n%s", stderr.String())
+	}
+
+	ledgerData, err := os.ReadFile(filepath.Join(centrolPath, "lighthouse.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledgerText := string(ledgerData)
+	if !strings.Contains(ledgerText, `"type":"policy.silence"`) || !strings.Contains(ledgerText, "scope-request poll failed") {
+		t.Fatalf("expected a policy.silence entry for the scope-poll error, got ledger:\n%s", ledgerText)
 	}
 }
