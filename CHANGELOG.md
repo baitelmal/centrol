@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.2.0 — 2026-10-01
+
+### Added
+
+- HTTP MCP transport for the proxy: `centrol proxy --target-url` fronts
+  HTTP MCP servers (Streamable HTTP, 2025-03-26 spec revision)
+- `[proxy] target_url`, `http_timeout_seconds`, `http_max_retries`
+- `[guard] git_timeout_seconds`
+- `[proxy] target_exit_timeout_seconds`
+- `centrol proxy install` now wraps URL-based (remote) server entries
+  too, not just stdio ones
+- `centrol audit --src guard|proxy` filter
+- Every config key is exposed in the `centrol config` menu and in "View
+  effective config"
+
+### Fixed
+
+- Session revocation handling in `HTTPTarget`
+- Malformed HTTP responses take the same silence path as a malformed
+  stdio frame
+- HTTP response body capped at 16MB before being read into memory
+- The session-teardown `DELETE` `HTTPTarget` sends on shutdown is
+  bounded at a fixed 5 seconds
+- `.centrol/` directories and sensitive files are now created 0700/0600
+  instead of inheriting the process umask
+- `centrol guard`'s snapshot no longer follows an untracked symlink that
+  points outside the repo
+- The same symlink-escape check guard's snapshot enforces is now also
+  enforced in the race window `scanExisting` covers
+- `EvaluateFSPath` (guard's filesystem-event evaluator) now consults
+  `ProtectedPaths` the same way `EvaluateToolCall` (proxy's) already
+  did — `centrol guard` now flags a credential-path write it previously
+  logged as clean, and an operator-configured
+  `proxy.additional_block_paths` entry now has effect under guard too
+- Every git subprocess guard/undo invoke (snapshot, restore) now runs
+  with a timeout, a minimal explicit environment, and a path resolved
+  once at setup, instead of inheriting the parent's full environment
+  with no bound on hang time
+- A target subprocess that ignores shutdown no longer hangs
+  `centrol proxy` forever — bounded by `target_exit_timeout_seconds`,
+  with a SIGKILL fallback
+- `internal/ledger`'s `Tail()` no longer loads every segment into memory
+  to serve a bounded request
+- Config writes are atomic, with cleanup of the temp file on a failed
+  rename
+- `HTTPTarget` refuses a cross-host or cross-scheme redirect outright,
+  so `Mcp-Session-Id` is never replayed to a different host
+- A panic in the client→target pump now surfaces through `Run`'s return
+  value instead of being silently swallowed
+- A ledger emit failure during `centrol guard`'s live watch now warns
+  (and escalates to `policy.silence` after 3 consecutive failures)
+  instead of being discarded
+
+### Changed
+
+- Process termination centralized in `Governor.Exit` — only `main`
+  calls `os.Exit`, on `main`'s own goroutine
+- Signals (SIGTERM/SIGINT/SIGHUP/SIGQUIT) route through the Governor
+
+### Notes
+
+- Tape capture (full-fidelity call/response recording) deferred to v0.3
+- Windows TTY behavior is untested; documented as a known limitation
+- The proxy serializes MCP calls; pipelining is deferred pending user
+  reports
+
 ## v0.1.1 — 2026-09-30
 
 Bug fix release. No new features, no config or CLI changes.

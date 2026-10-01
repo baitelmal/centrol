@@ -43,8 +43,11 @@ curl -fsSL https://raw.githubusercontent.com/baitelmal/centrol/main/install-cent
 # Wrap an interactive agent session; nothing to configure first.
 centrol guard -- claude
 
-# Or front an MCP server so its tool calls get logged and policy-checked.
+# Or front a stdio MCP server so its tool calls get logged and policy-checked.
 centrol proxy --target "npx @modelcontextprotocol/server-filesystem /path/to/allow"
+
+# Or front an HTTP MCP server the same way.
+centrol proxy --target-url "https://mcp.example.com/sse"
 
 # See what happened.
 centrol audit
@@ -107,12 +110,14 @@ centrol guard --scope <path> -- ...    same, narrowed to one or more paths
 centrol guard --observe -- ...         evaluate policy without ever prompting or blocking
 centrol guard --quiet -- ...           log_level=warn for this run
 centrol guard --verbose -- ...         log_level=debug for this run (traces every governed event)
-centrol proxy --target <mcp server>    run the MCP gateway
+centrol proxy --target <mcp server>    run the MCP gateway, fronting a stdio MCP server
+centrol proxy --target-url <url>       same, fronting an HTTP MCP server instead (see "HTTP MCP servers" below)
 centrol proxy --observe --target ...   same evaluate-only mode, for the MCP path
 centrol proxy install <client>         patch a client's MCP config
 centrol audit                          view the ledger
 centrol audit --flagged                only policy.violation entries
 centrol audit --blocked                only tool.blocked entries
+centrol audit --src guard|proxy        only entries from one source
 centrol audit --since 30m|1h|2d        entries from the last window
 centrol audit --run <run_id>           entries from one run only
 centrol audit --verify                 verify hash-chain integrity across all segments
@@ -130,6 +135,10 @@ the end of every `guard`/`proxy` invocation (see "Run summary" below) —
 they only raise or lower the bar for the info-level step/state lines in
 between.
 
+`--target` and `--target-url` are mutually exclusive — pick one transport
+per invocation. If neither is given, `centrol proxy` falls back to the
+configured `proxy.target_url`, if one is set.
+
 ## `centrol proxy install`
 
 ```
@@ -138,17 +147,49 @@ centrol proxy install cursor             patch Cursor's MCP config
 centrol proxy install windsurf           patch Windsurf's MCP config
 ```
 
-Rewrites every locally-run (stdio) MCP server entry in that client's
-config file so it launches through `centrol proxy --target ...` instead
-of directly — the client itself doesn't change, and every tool call it
-makes to that server is now logged and policy-checked. Remote servers
-(anything configured with a `url`/`serverUrl` instead of a `command`)
-are left untouched, since this proxy only fronts stdio targets. Always
-backs up the original config first (`<config>.centrol-backup-<timestamp>`)
-and is safe to re-run — an already-wrapped entry is left alone. The
-client needs to have been opened at least once already, so its config
-file exists; restart the client afterward for the change to take
-effect.
+Rewrites every MCP server entry in that client's config file so it
+launches through `centrol proxy` instead of directly — the client
+itself doesn't change, and every tool call it makes to that server is
+now logged and policy-checked. A locally-run (stdio) entry is wrapped
+through `centrol proxy --target ...`; a remote entry (anything
+configured with a `url` or `serverUrl` field instead of a `command`) is
+wrapped through `centrol proxy --target-url ...` instead — both kinds
+are rewritten the same way, nothing is left untouched. Always backs up
+the original config first (`<config>.centrol-backup-<timestamp>`) and
+is safe to re-run — an already-wrapped entry (stdio or remote) is left
+alone. The client needs to have been opened at least once already, so
+its config file exists; restart the client afterward for the change to
+take effect.
+
+## HTTP MCP servers
+
+`centrol proxy --target-url <url>` fronts an HTTP MCP server (the
+Streamable HTTP transport, 2025-03-26 spec revision) the same way
+`--target` fronts a stdio one — every tool call is logged and
+policy-checked before it's forwarded. `--target` and `--target-url` are
+mutually exclusive; with neither given, the configured `proxy.target_url`
+is used if set.
+
+- **Session handling** — the `Mcp-Session-Id` the target issues on its
+  first response is carried on every subsequent request; a 404 response
+  means the target considers that session gone, which the proxy treats
+  the same as any other malformed/unexpected response (see "Protocol
+  Silence" in "Policy denials" below), not as a crash. The header is
+  never replayed across a redirect to a different host (see below).
+- **Timeouts** — `proxy.http_timeout_seconds` (default 60, floor 5)
+  bounds every request to the target. The best-effort session-teardown
+  `DELETE` `centrol proxy` sends on shutdown is bounded separately, at a
+  fixed 5 seconds, regardless of that setting.
+- **Retries** — `proxy.http_max_retries` (default 2, floor 0) retries a
+  request only when it failed to even reach the target (a dial failure)
+  — never for a response that came back late, or with a 4xx/5xx status;
+  retrying either of those could replay a call the target may already
+  have acted on.
+- **Response size** — a single JSON response body is capped at 16MB;
+  larger responses are refused rather than read into memory in full.
+- **Redirects** — same-host redirects are followed, up to 3; any
+  cross-host or cross-scheme redirect is refused outright, so a
+  session's credentials are never sent to a different host.
 
 ## Config (`.centrol/config.toml` or `~/.centrol/config.toml`)
 
@@ -161,20 +202,26 @@ through the same resolver.
 
 ```toml
 [guard]
-mass_mutation_threshold = 20        # files touched by one action before it's flagged as mass mutation
-watcher_debounce_ms = 300           # coalesce rapid writes to the same path into one ledger entry
+watcher_debounce_ms = 100           # coalesce rapid writes to the same path into one ledger entry
+git_timeout_seconds = 30            # bounds every git subprocess guard/undo invoke (snapshot, restore); floor 5
 
 [gate]
-prompt_timeout_seconds = 120        # a flagged action with no answer in time is denied, not left hanging
+prompt_timeout_seconds = 300        # a flagged action with no answer in time is denied, not left hanging
 allow_session_amend = true          # "Allow session" persists for the rest of this run only
 
 [proxy]
+mass_mutation_threshold = 20        # tool calls touching more files than this in one call are flagged (proxy-only; guard does not evaluate this)
 allowed_servers = []                # MCP server identities pre-approved without a prompt
 strict_matching = false             # true: match server identity exactly, not just by package/binary
-additional_block_paths = []         # extra hard-blocked paths for the proxy, on top of the built-in ~/.ssh, ~/.aws, /etc, /root
-                                     # (proxy-only — see the guard/proxy enforcement note above; guard flags a
-                                     # write to any of these paths but does not, and cannot, block it)
-mcp_call_timeout_seconds = 30       # a forwarded MCP call with no response in time is dropped, not left hanging
+additional_block_paths = []         # extra hard-blocked paths, on top of the built-in ~/.ssh, ~/.aws, /etc, /root
+                                     # (consulted by both guard and proxy — guard flags a write to any of
+                                     # these paths but does not, and cannot, block it; see the enforcement
+                                     # note above)
+mcp_call_timeout_seconds = 60       # a forwarded MCP call with no response in time is dropped, not left hanging
+target_url = ""                     # front an HTTP MCP server by default, without passing --target-url every run
+http_timeout_seconds = 60           # per-request timeout for an HTTP target; floor 5
+http_max_retries = 2                # retries for a dial failure only (never for a timeout or a 4xx/5xx response); floor 0
+target_exit_timeout_seconds = 10    # bounds how long proxy waits for the target to exit after Stop before SIGKILLing it; floor 2
 
 [general]
 log_level = "info"                  # "info" | "warn" | "debug" — overridden per run by --quiet/--verbose
@@ -232,6 +279,16 @@ act on:
 ```json
 {"jsonrpc":"2.0","id":7,"error":{"code":-32001,"message":"blocked by policy",
  "data":{"reason":"credential_path","target":"~/.ssh/id_rsa","suggestion":"..."}}}
+```
+
+An MCP-call timeout (`proxy.mcp_call_timeout_seconds`) comes back the
+same way, but as its own code and message, since no one made a decision
+about the call's legitimacy — it just didn't finish in time — though the
+`data` shape an agent branches on is identical:
+
+```json
+{"jsonrpc":"2.0","id":8,"error":{"code":-32000,"message":"mcp call timeout",
+ "data":{"reason":"mcp_call_timeout","target":"some_tool","suggestion":"..."}}}
 ```
 
 ("Protocol Silence" — a dropped frame with no response — is reserved for
@@ -309,11 +366,17 @@ just confirmed is untampered.
 
 ## Roadmap
 
-- **v0.1** — guard + proxy (current)
-- **v0.2** — hardened surfaces, more tests, install polish
+- **v0.1** — guard + proxy
+- **v0.2** — shipped: HTTP MCP transport (`--target-url`), hardened
+  subprocess/filesystem/network surfaces, `proxy install` wraps remote
+  servers too, broader test coverage
+- **v0.2.x** — continued hardening on the v0.2 surfaces
 - **v0.3** — verify, a validator surface: attempt → test → invariant
   check → packet → approve/reject, gated the same way guard and proxy
-  are today.
+  are today; tape capture (full-fidelity call/response recording) also
+  lands here
+- **v1.0** — stability: the CLI, config keys, and ledger schema are
+  frozen as a compatibility contract
 
 No dates are committed. This is the order the surfaces are meant to
 arrive in, not a schedule.
