@@ -908,6 +908,46 @@ func TestConfigMenuRejectsInvalidTargetURLScheme(t *testing.T) {
 	}
 }
 
+// TestConfigMenuEditsGitTimeoutSeconds drives the guard submenu's "Edit
+// git_timeout_seconds" option (audit item 4e's new config key): a value
+// below the floor is rejected with no write, and a valid value is
+// accepted, persisted, and visible from "View effective config".
+func TestConfigMenuEditsGitTimeoutSeconds(t *testing.T) {
+	dir := t.TempDir()
+	resolver := policy.NewResolver(
+		policy.NewSessionContractSource(),
+		policy.NewEnterpriseSource(),
+		policy.NewLocalFileSource(policy.SourceRepoConfig, filepath.Join(dir, "repo-config.toml")),
+		policy.NewLocalFileSource(policy.SourceUserConfig, filepath.Join(dir, "user-config.toml")),
+		policy.NewDefaultSource(nil),
+	)
+
+	// Guard section (4), edit git_timeout_seconds (2), a below-floor
+	// value, then a valid value, then view effective config, then quit.
+	in := bufio.NewReader(strings.NewReader("4\n2\n2\n2\n45\nb\n7\nq\n"))
+	var out bytes.Buffer
+	runConfigMenu(in, &out, resolver)
+
+	got := out.String()
+	if !strings.Contains(got, fmt.Sprintf("cannot be below %d", policy.MinGitTimeoutSeconds)) {
+		t.Fatalf("expected the below-floor value to be rejected, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Set git_timeout_seconds = 45") {
+		t.Fatalf("expected the valid value to be accepted, got:\n%s", got)
+	}
+	if !strings.Contains(got, "guard.git_timeout_seconds") || !strings.Contains(got, "45") {
+		t.Fatalf("expected git_timeout_seconds = 45 to show up in the effective config view, got:\n%s", got)
+	}
+
+	repoData, err := os.ReadFile(filepath.Join(dir, "repo-config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(repoData), "git_timeout_seconds") {
+		t.Fatalf("expected git_timeout_seconds to be persisted, got:\n%s", repoData)
+	}
+}
+
 // ===========================================================================
 // Ship criterion 9: the run summary prints on every trappable exit path
 // (normal, panic, SIGINT, SIGTERM), is never suppressed by --quiet, and

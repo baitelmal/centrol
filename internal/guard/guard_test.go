@@ -22,6 +22,15 @@ func run(t *testing.T, dir, name string, args ...string) string {
 	return string(out)
 }
 
+func testGitRunner(t *testing.T) *GitRunner {
+	t.Helper()
+	g, err := NewGitRunner(30 * time.Second)
+	if err != nil {
+		t.Fatalf("NewGitRunner: %v", err)
+	}
+	return g
+}
+
 func initRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -219,7 +228,7 @@ func TestSnapshotExcludesCentrolAndGitDirs(t *testing.T) {
 	}
 
 	snapDir := filepath.Join(t.TempDir(), "run-2")
-	if err := Snapshot(repo, snapDir, ignore); err != nil {
+	if err := Snapshot(repo, snapDir, ignore, testGitRunner(t)); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
@@ -262,7 +271,7 @@ func TestSnapshotAndRestoreRoundTrip(t *testing.T) {
 	}
 
 	snapDir := filepath.Join(t.TempDir(), "run-1")
-	if err := Snapshot(repo, snapDir, ignore); err != nil {
+	if err := Snapshot(repo, snapDir, ignore, testGitRunner(t)); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	for _, f := range []string{"head.txt", "stash.diff", "manifest.json"} {
@@ -282,7 +291,7 @@ func TestSnapshotAndRestoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	outcome, err := Restore(repo, snapDir)
+	outcome, err := Restore(repo, snapDir, testGitRunner(t))
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -329,7 +338,7 @@ func TestPreUndoSnapshotRecoversFailedRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	preUndoDir, err := PreUndoSnapshot(repo, snapshotsRoot, "run-1", ignore)
+	preUndoDir, err := PreUndoSnapshot(repo, snapshotsRoot, "run-1", ignore, testGitRunner(t))
 	if err != nil {
 		t.Fatalf("PreUndoSnapshot: %v", err)
 	}
@@ -342,7 +351,7 @@ func TestPreUndoSnapshotRecoversFailedRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Restore(repo, preUndoDir); err != nil {
+	if _, err := Restore(repo, preUndoDir, testGitRunner(t)); err != nil {
 		t.Fatalf("recovering via pre-undo snapshot failed: %v", err)
 	}
 	mainGo, _ := os.ReadFile(filepath.Join(repo, "main.go"))
@@ -542,7 +551,7 @@ func TestSnapshotDoesNotFollowUntrackedSymlinks(t *testing.T) {
 	}
 
 	snapDir := filepath.Join(t.TempDir(), "run-1")
-	if err := Snapshot(repo, snapDir, ignore); err != nil {
+	if err := Snapshot(repo, snapDir, ignore, testGitRunner(t)); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
@@ -595,7 +604,7 @@ func TestSnapshotWritesPrivateFilePermissions(t *testing.T) {
 	}
 
 	snapDir := filepath.Join(t.TempDir(), "run-1")
-	if err := Snapshot(repo, snapDir, ignore); err != nil {
+	if err := Snapshot(repo, snapDir, ignore, testGitRunner(t)); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 
@@ -705,5 +714,96 @@ func TestScanExistingBlocksSymlinkEscape(t *testing.T) {
 	}
 	if !foundPlain {
 		t.Fatalf("expected the ordinary file in the same race-window directory to still be emitted as fs.create, got creates=%v", creates)
+	}
+}
+
+// TestNewGitRunnerFailsAtSetupWhenGitNotOnPATH is 4e's "fail at setup,
+// not per-call" requirement: NewGitRunner resolves git once via
+// exec.LookPath, so a missing git binary is caught immediately with a
+// clear error rather than resurfacing confusingly on whichever git
+// subcommand happens to run first inside Snapshot/Restore.
+func TestNewGitRunnerFailsAtSetupWhenGitNotOnPATH(t *testing.T) {
+	emptyPATHDir := t.TempDir()
+	t.Setenv("PATH", emptyPATHDir)
+
+	_, err := NewGitRunner(30 * time.Second)
+	if err == nil {
+		t.Fatal("expected NewGitRunner to fail when git is not on PATH")
+	}
+	if !strings.Contains(err.Error(), "git") {
+		t.Fatalf("expected a clear error naming git, got: %v", err)
+	}
+}
+
+// TestGitRunnerTimesOutOnHangingGit confirms a git subprocess that hangs
+// past the configured timeout is killed rather than blocking forever —
+// 4e's bounded-execution requirement. It replaces "git" on PATH with a
+// stub script that sleeps, since there's no portable way to make the
+// real git binary hang.
+func TestGitRunnerTimesOutOnHangingGit(t *testing.T) {
+	stubDir := t.TempDir()
+	stubGit := filepath.Join(stubDir, "git")
+	script := "#!/bin/sh\n/usr/bin/sleep 30\n"
+	if err := os.WriteFile(stubGit, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stubDir)
+
+	git, err := NewGitRunner(200 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewGitRunner: %v", err)
+	}
+
+	start := time.Now()
+	_, err = git.run(t.TempDir(), "status")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected the hanging git stub to time out")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("expected a timeout error, got: %v", err)
+	}
+	// Bounded by g.timeout (200ms) plus gitWaitDelay's grace period for
+	// the pipe-holding grandchild (the stub's own `sleep`) to be forced
+	// off the output pipes — comfortably under the stub's full 30s sleep
+	// either way.
+	if elapsed > 10*time.Second {
+		t.Fatalf("expected the timeout to bound execution near 200ms+gitWaitDelay, took %s", elapsed)
+	}
+}
+
+// TestGitRunnerPassesMinimalEnv confirms git subprocesses see only
+// PATH, HOME, and GIT_* variables — not centrol's full inherited
+// environment, which may carry secrets with no reason to reach git.
+func TestGitRunnerPassesMinimalEnv(t *testing.T) {
+	stubDir := t.TempDir()
+	envDump := filepath.Join(stubDir, "env-dump.txt")
+	stubGit := filepath.Join(stubDir, "git")
+	script := "#!/bin/sh\n/usr/bin/env > " + envDump + "\n"
+	if err := os.WriteFile(stubGit, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", stubDir)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("SOME_OTHER_SECRET", "must-not-reach-git")
+
+	git, err := NewGitRunner(5 * time.Second)
+	if err != nil {
+		t.Fatalf("NewGitRunner: %v", err)
+	}
+	if _, err := git.run(t.TempDir(), "status"); err != nil {
+		t.Fatalf("git.run: %v", err)
+	}
+
+	dumped, err := os.ReadFile(envDump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envStr := string(dumped)
+	if !strings.Contains(envStr, "GIT_CONFIG_NOSYSTEM=1") {
+		t.Fatalf("expected GIT_* vars to be passed through, got env:\n%s", envStr)
+	}
+	if strings.Contains(envStr, "SOME_OTHER_SECRET") {
+		t.Fatalf("expected non-PATH/HOME/GIT_* vars to be excluded, got env:\n%s", envStr)
 	}
 }

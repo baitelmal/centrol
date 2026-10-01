@@ -6,8 +6,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/scirem/centrol/internal/guard"
+	"github.com/scirem/centrol/internal/policy"
 )
 
 // cmdUndo implements `centrol undo`, `centrol undo --list`,
@@ -71,17 +73,29 @@ func cmdUndo(args []string) {
 		fatalf("centrol undo: %v", err)
 	}
 
+	// Resolved once, at setup, same as `centrol guard` — see its own
+	// comment on this pattern.
+	resolver := newResolver(root)
+	gitTimeoutSecs, _, err := policy.ResolveGitTimeoutSeconds(resolver)
+	if err != nil {
+		fatalf("centrol undo: %v", err)
+	}
+	gitRunner, err := guard.NewGitRunner(time.Duration(gitTimeoutSecs) * time.Second)
+	if err != nil {
+		fatalf("centrol undo: %v", err)
+	}
+
 	// MANDATORY: snapshot the current (pre-rollback) state before doing
 	// anything destructive, so a rollback that fails partway is itself
 	// recoverable via `centrol undo --from <snapshot_id>.pre-undo`.
 	preUndoRunID := snapshotName
-	preUndoDir, err := guard.PreUndoSnapshot(root, snapRoot, preUndoRunID, ignore)
+	preUndoDir, err := guard.PreUndoSnapshot(root, snapRoot, preUndoRunID, ignore, gitRunner)
 	if err != nil {
 		fatalf("centrol undo: %v", err)
 	}
 	fmt.Fprintf(os.Stderr, "centrol: pre-undo snapshot saved to %s\n", preUndoDir)
 
-	outcome, err := guard.Restore(root, snapDir)
+	outcome, err := guard.Restore(root, snapDir, gitRunner)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "centrol undo: rollback failed partway: %v\n", err)
 		fmt.Fprintf(os.Stderr, "centrol: your tree may be in a mixed state. Recover with: centrol undo --from %s\n", filepath.Base(preUndoDir))

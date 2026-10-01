@@ -105,10 +105,28 @@ func cmdGuard(args []string) {
 		return
 	}
 
+	// Audit fix (4e): resolved once, at setup, before the snapshot that
+	// needs it — a missing git binary or a misconfigured timeout fails
+	// clearly here rather than resurfacing confusingly mid-snapshot.
+	var gitRunner *guard.GitRunner
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		gitTimeoutSecs, _, e := policy.ResolveGitTimeoutSeconds(resolver)
+		if e != nil {
+			return e
+		}
+		gitRunner, e = guard.NewGitRunner(time.Duration(gitTimeoutSecs) * time.Second)
+		return e
+	}); err != nil {
+		end("git_runner_setup_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol guard: %v\n", err)
+		})
+		return
+	}
+
 	snapDir := filepath.Join(snapshotsDir(root), runID)
 	logger.Infof("centrol: snapshotting repo before run %s...\n", runID)
 	if err := runSetup(ctx, end, signalOutcome, func() error {
-		return guard.Snapshot(root, snapDir, ignore)
+		return guard.Snapshot(root, snapDir, ignore, gitRunner)
 	}); err != nil {
 		// Race (b) (Pass 3.9 Section 5): a SIGTERM/SIGINT that lands here
 		// can kill git's own subprocess directly (it shares centrol's

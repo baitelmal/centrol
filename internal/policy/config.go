@@ -17,6 +17,8 @@ const (
 	KeyProxyTargetURL        = "proxy.target_url"
 	KeyProxyHTTPTimeoutSecs  = "proxy.http_timeout_seconds"
 	KeyProxyHTTPMaxRetries   = "proxy.http_max_retries"
+	KeyGitTimeoutSeconds     = "guard.git_timeout_seconds"
+	KeyTargetExitTimeoutSecs = "proxy.target_exit_timeout_seconds"
 )
 
 const (
@@ -29,6 +31,10 @@ const (
 	MinHTTPTimeoutSeconds        = 5
 	DefaultHTTPMaxRetries        = 2
 	MinHTTPMaxRetries            = 0
+	DefaultGitTimeoutSeconds     = 30
+	MinGitTimeoutSeconds         = 5
+	DefaultTargetExitTimeoutSecs = 10
+	MinTargetExitTimeoutSecs     = 2
 )
 
 // ResolvePromptTimeoutSeconds resolves gate.prompt_timeout_seconds,
@@ -169,6 +175,52 @@ func ResolveObserveMode(r *Resolver) (observe bool, source string, err error) {
 		return false, "", fmt.Errorf("%s must be true or false, got %v (from %s)", KeyObserveMode, raw, src)
 	}
 	return b, src, nil
+}
+
+// ResolveGitTimeoutSeconds resolves guard.git_timeout_seconds, defaulting
+// to DefaultGitTimeoutSeconds and enforcing the hard floor
+// MinGitTimeoutSeconds — same shape as ResolveMCPCallTimeoutSeconds. A
+// hung git subprocess (e.g. a credential-helper prompt with no TTY)
+// would otherwise block a guarded run forever.
+func ResolveGitTimeoutSeconds(r *Resolver) (seconds int, source string, err error) {
+	raw, src, found, err := r.Resolve(KeyGitTimeoutSeconds)
+	if err != nil {
+		return 0, "", err
+	}
+	if !found {
+		return DefaultGitTimeoutSeconds, SourceDefault, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, "", fmt.Errorf("%s must be an integer, got %v (from %s)", KeyGitTimeoutSeconds, raw, src)
+	}
+	if n < MinGitTimeoutSeconds {
+		return 0, "", fmt.Errorf("%s = %d is below the minimum of %d (from %s)", KeyGitTimeoutSeconds, n, MinGitTimeoutSeconds, src)
+	}
+	return n, src, nil
+}
+
+// ResolveTargetExitTimeoutSeconds resolves
+// proxy.target_exit_timeout_seconds, defaulting to
+// DefaultTargetExitTimeoutSecs and enforcing the hard floor
+// MinTargetExitTimeoutSecs. This bounds how long the proxy waits for a
+// signaled target subprocess to exit before escalating to SIGKILL.
+func ResolveTargetExitTimeoutSeconds(r *Resolver) (seconds int, source string, err error) {
+	raw, src, found, err := r.Resolve(KeyTargetExitTimeoutSecs)
+	if err != nil {
+		return 0, "", err
+	}
+	if !found {
+		return DefaultTargetExitTimeoutSecs, SourceDefault, nil
+	}
+	n, ok := raw.(int)
+	if !ok {
+		return 0, "", fmt.Errorf("%s must be an integer, got %v (from %s)", KeyTargetExitTimeoutSecs, raw, src)
+	}
+	if n < MinTargetExitTimeoutSecs {
+		return 0, "", fmt.Errorf("%s = %d is below the minimum of %d (from %s)", KeyTargetExitTimeoutSecs, n, MinTargetExitTimeoutSecs, src)
+	}
+	return n, src, nil
 }
 
 // Mass-mutation threshold bounds. The default is a sane starting point;

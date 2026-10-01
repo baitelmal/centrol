@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ManifestEntry is one file's record in manifest.json.
@@ -27,9 +29,6 @@ type Manifest struct {
 	Files []ManifestEntry `json:"files"`
 }
 
-// runGit returns stdout only, trimmed. Stderr is captured separately so
-// warnings/notices on stderr (e.g. line-ending notes) never leak into
-// stdout and corrupt output we treat as data, such as diff patches.
 // isCentrolOrGitPath mirrors the watcher's hard .centrol//.git exclusion
 // (see hardExcludedAbs in watch.go) for the repo-relative paths this
 // file works with. It is intentionally a separate implementation
@@ -46,31 +45,107 @@ func isCentrolOrGitPath(relPath string) bool {
 		relPath == ".git" || strings.HasPrefix(relPath, ".git/")
 }
 
-func runGit(repoRoot string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = repoRoot
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+// GitRunner is the single point through which Snapshot/Restore invoke
+// git. Audit fix (4e): the previous runGit/runGitRaw resolved "git" via
+// PATH on every single invocation and had no timeout or explicit
+// environment at all. Re-resolving via PATH on every call means a
+// malicious entry placed earlier in PATH than the real git binary is
+// consulted on every snapshot and restore, not just once — resolving it
+// once at construction and reusing the absolute path closes that
+// window and fails fast at setup if git isn't available, rather than
+// failing confusingly deep inside a run. The timeout bounds a git
+// subprocess that would otherwise hang forever (e.g. a credential
+// helper blocking on a TTY prompt that will never come), and the
+// explicit minimal environment keeps the rest of centrol's process
+// environment (which may carry secrets destined for the proxy target,
+// not for git) from being handed to the subprocess wholesale.
+type GitRunner struct {
+	path    string
+	timeout time.Duration
+}
+
+// NewGitRunner resolves git's absolute path once and fixes the
+// per-invocation timeout for the lifetime of the runner. Call this once
+// at guard construction, not per-call — a missing git binary should
+// fail setup immediately, not resurface as a mid-run error on whichever
+// git subcommand happens to run first.
+func NewGitRunner(timeout time.Duration) (*GitRunner, error) {
+	path, err := exec.LookPath("git")
 	if err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return nil, fmt.Errorf("git not found on PATH: %w", err)
+	}
+	return &GitRunner{path: path, timeout: timeout}, nil
+}
+
+// minimalGitEnv returns PATH, HOME, and any already-set GIT_* variables
+// — the set git actually needs to run and locate repo-local config —
+// rather than the full inherited environment, which may carry secrets
+// (e.g. a target URL's embedded token passed to the proxy via env) that
+// git has no business seeing.
+func minimalGitEnv() []string {
+	var env []string
+	for _, key := range []string{"PATH", "HOME"} {
+		if v, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+v)
+		}
+	}
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "GIT_") {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
+
+// run returns stdout only, trimmed. Stderr is captured separately so
+// warnings/notices on stderr (e.g. line-ending notes) never leak into
+// stdout and corrupt output we treat as data, such as diff patches.
+func (g *GitRunner) run(repoRoot string, args ...string) (string, error) {
+	out, err := g.exec(repoRoot, args...)
+	if err != nil {
+		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
-// runGitRaw is like runGit but returns stdout untrimmed, for output
-// where leading/trailing whitespace is semantically meaningful (diff
-// patches — a trailing newline can matter to `git apply`).
-func runGitRaw(repoRoot string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+// runRaw is like run but returns stdout untrimmed, for output where
+// leading/trailing whitespace is semantically meaningful (diff patches —
+// a trailing newline can matter to `git apply`).
+func (g *GitRunner) runRaw(repoRoot string, args ...string) (string, error) {
+	out, err := g.exec(repoRoot, args...)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// gitWaitDelay bounds how much longer Wait() is allowed to block after
+// the context kills git itself, before Go forcibly closes git's
+// stdout/stderr pipes and gives up on them. Without this, a grandchild
+// process that git spawned and that inherited those pipe file
+// descriptors (a pager, a credential helper, a hook) can hold them open
+// after git itself is killed, leaving Wait() blocked long past the
+// configured timeout even though the thing actually being timed out —
+// git — is already dead.
+const gitWaitDelay = 5 * time.Second
+
+func (g *GitRunner) exec(repoRoot string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), g.timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, g.path, args...)
+	cmd.WaitDelay = gitWaitDelay
 	cmd.Dir = repoRoot
+	cmd.Env = minimalGitEnv()
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("git %s: timed out after %s", strings.Join(args, " "), g.timeout)
+		}
+		return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
-	return string(out), nil
+	return out, nil
 }
 
 // Snapshot writes the four required components under snapshotDir:
@@ -78,7 +153,7 @@ func runGitRaw(repoRoot string, args ...string) (string, error) {
 // repo (git stash create does not touch the working tree or the stash
 // ref list, per the mandatory instruction to avoid relying on stash
 // refs).
-func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
+func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet, git *GitRunner) error {
 	// 0700/0600 throughout this function: a snapshot captures the full
 	// working-tree diff and every untracked file's content (see the
 	// untracked-file loop below), which routinely includes secrets an
@@ -88,7 +163,7 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
 		return err
 	}
 
-	head, err := runGit(repoRoot, "rev-parse", "HEAD")
+	head, err := git.run(repoRoot, "rev-parse", "HEAD")
 	if err != nil {
 		return fmt.Errorf("snapshot: resolving HEAD: %w", err)
 	}
@@ -99,13 +174,13 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
 	// git stash create returns a commit hash representing working tree +
 	// index changes without touching the working tree or the stash ref
 	// list; empty output means a clean tree.
-	stashHash, err := runGit(repoRoot, "stash", "create")
+	stashHash, err := git.run(repoRoot, "stash", "create")
 	if err != nil {
 		return fmt.Errorf("snapshot: git stash create: %w", err)
 	}
 	diff := ""
 	if stashHash != "" {
-		diff, err = runGitRaw(repoRoot, "diff", "--binary", head, stashHash)
+		diff, err = git.runRaw(repoRoot, "diff", "--binary", head, stashHash)
 		if err != nil {
 			return fmt.Errorf("snapshot: diffing stash: %w", err)
 		}
@@ -114,11 +189,11 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
 		return err
 	}
 
-	untrackedOut, err := runGit(repoRoot, "ls-files", "--others", "--exclude-standard")
+	untrackedOut, err := git.run(repoRoot, "ls-files", "--others", "--exclude-standard")
 	if err != nil {
 		return fmt.Errorf("snapshot: listing untracked files: %w", err)
 	}
-	trackedOut, err := runGit(repoRoot, "ls-files")
+	trackedOut, err := git.run(repoRoot, "ls-files")
 	if err != nil {
 		return fmt.Errorf("snapshot: listing tracked files: %w", err)
 	}
@@ -215,7 +290,7 @@ type RestoreOutcome struct {
 // MUST take a pre-undo snapshot of the current state before calling
 // Restore (see PreUndoSnapshot) so a failed rollback is itself
 // recoverable.
-func Restore(repoRoot, snapshotDir string) (RestoreOutcome, error) {
+func Restore(repoRoot, snapshotDir string, git *GitRunner) (RestoreOutcome, error) {
 	var out RestoreOutcome
 
 	headBytes, err := os.ReadFile(filepath.Join(snapshotDir, "head.txt"))
@@ -224,7 +299,7 @@ func Restore(repoRoot, snapshotDir string) (RestoreOutcome, error) {
 	}
 	head := strings.TrimSpace(string(headBytes))
 
-	if _, err := runGit(repoRoot, "reset", "--hard", head); err != nil {
+	if _, err := git.run(repoRoot, "reset", "--hard", head); err != nil {
 		return out, fmt.Errorf("restore: git reset --hard %s: %w", head, err)
 	}
 	out.RestoredTracked = true
@@ -244,7 +319,7 @@ func Restore(repoRoot, snapshotDir string) (RestoreOutcome, error) {
 			return out, err
 		}
 		tmp.Close()
-		if _, err := runGit(repoRoot, "apply", "--binary", tmp.Name()); err != nil {
+		if _, err := git.run(repoRoot, "apply", "--binary", tmp.Name()); err != nil {
 			return out, fmt.Errorf("restore: git apply stash.diff: %w", err)
 		}
 	}
@@ -275,7 +350,7 @@ func Restore(repoRoot, snapshotDir string) (RestoreOutcome, error) {
 	// not part of the snapshot and so could not have been restored from
 	// it (e.g. ignored files, files the agent created after the snapshot
 	// that the snapshot's own untracked/ copy never captured).
-	nowUntracked, err := runGit(repoRoot, "ls-files", "--others", "--exclude-standard")
+	nowUntracked, err := git.run(repoRoot, "ls-files", "--others", "--exclude-standard")
 	if err == nil {
 		restoredSet := map[string]bool{}
 		for _, r := range out.RestoredUntracked {
@@ -298,9 +373,9 @@ func Restore(repoRoot, snapshotDir string) (RestoreOutcome, error) {
 // destructive rollback" rule impossible to accidentally skip at a call
 // site: it names the snapshot directory per the <run_id>.pre-undo
 // convention documented for `centrol undo --from`.
-func PreUndoSnapshot(repoRoot, snapshotsRoot, runID string, ignore *IgnoreSet) (string, error) {
+func PreUndoSnapshot(repoRoot, snapshotsRoot, runID string, ignore *IgnoreSet, git *GitRunner) (string, error) {
 	dir := filepath.Join(snapshotsRoot, runID+".pre-undo")
-	if err := Snapshot(repoRoot, dir, ignore); err != nil {
+	if err := Snapshot(repoRoot, dir, ignore, git); err != nil {
 		return "", fmt.Errorf("pre-undo snapshot failed, refusing to proceed with rollback: %w", err)
 	}
 	return dir, nil

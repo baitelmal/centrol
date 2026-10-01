@@ -417,10 +417,17 @@ func configGuardMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver)
 			fmt.Fprintf(out, "error: %v\n", err)
 			return
 		}
+		gitTimeout, gitTimeoutSrc, err := policy.ResolveGitTimeoutSeconds(resolver)
+		if err != nil {
+			fmt.Fprintf(out, "error: %v\n", err)
+			return
+		}
 
 		fmt.Fprintln(out, "\nGuard")
 		printLockable(out, "watcher_debounce_ms", debounce, debounceSrc)
+		printLockable(out, "git_timeout_seconds", gitTimeout, gitTimeoutSrc)
 		fmt.Fprintln(out, "  1) Edit watcher_debounce_ms")
+		fmt.Fprintln(out, "  2) Edit git_timeout_seconds")
 		fmt.Fprintln(out, "  b) Back")
 		fmt.Fprint(out, "> ")
 
@@ -450,6 +457,28 @@ func configGuardMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver)
 				continue
 			}
 			fmt.Fprintf(out, "Set watcher_debounce_ms = %d (%s). Effective on the next `centrol guard` run.\n", v, src)
+		case "2":
+			if lockedByEnterprise(gitTimeoutSrc) {
+				fmt.Fprintln(out, "git_timeout_seconds is locked by enterprise policy and cannot be edited here")
+				continue
+			}
+			fmt.Fprintf(out, "New value (seconds, >= %d): ", policy.MinGitTimeoutSeconds)
+			raw := readMenuLine(in)
+			v, err := strconv.Atoi(raw)
+			if err != nil {
+				fmt.Fprintf(out, "error: %q is not an integer\n", raw)
+				continue
+			}
+			if v < policy.MinGitTimeoutSeconds {
+				fmt.Fprintf(out, "error: git_timeout_seconds cannot be below %d\n", policy.MinGitTimeoutSeconds)
+				continue
+			}
+			src, err := resolver.WriteConfig(policy.KeyGitTimeoutSeconds, v)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				continue
+			}
+			fmt.Fprintf(out, "Set git_timeout_seconds = %d (%s). Effective on the next `centrol guard`/`centrol undo` run.\n", v, src)
 		default:
 			fmt.Fprintln(out, "Not a recognized option.")
 		}
@@ -614,6 +643,9 @@ func configViewEffective(out io.Writer, resolver *policy.Resolver) {
 	}
 	if v, s, err := policy.ResolveWatcherDebounceMS(resolver); err == nil {
 		printRow("guard.watcher_debounce_ms", v, s)
+	}
+	if v, s, err := policy.ResolveGitTimeoutSeconds(resolver); err == nil {
+		printRow("guard.git_timeout_seconds", v, s)
 	}
 	if v, s, err := policy.ResolveLogLevel(resolver); err == nil {
 		printRow("general.log_level", v, s)

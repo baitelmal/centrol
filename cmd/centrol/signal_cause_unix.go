@@ -17,7 +17,7 @@ import (
 // "signal: terminated" error on the snapshot path instead of (or
 // racing) the early signal handler.
 //
-// errors.As walks err's full %w chain (guard.runGit wraps the raw
+// errors.As walks err's full %w chain (guard.GitRunner wraps the raw
 // *exec.ExitError once, guard.Snapshot wraps that again), so this finds
 // the underlying ExitError regardless of how many layers of context
 // guard.Snapshot's own error wrapping added.
