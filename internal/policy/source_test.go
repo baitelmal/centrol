@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -79,6 +80,57 @@ func TestLocalFileSourceWritePreservesOtherKeys(t *testing.T) {
 	}
 	if s, ok := servers.([]string); !ok || len(s) != 1 || s[0] != "@scope/pkg" {
 		t.Fatalf("expected [@scope/pkg], got %v", servers)
+	}
+}
+
+// TestLocalFileSourceWriteCleansUpTempFileOnFailedRename is the
+// audit's 4d fix: Write used a fixed ".tmp" name with no cleanup on a
+// failed rename. This forces a deterministic rename failure (the
+// destination is itself a directory — renaming a file onto a
+// directory always fails) and confirms no orphan "*.tmp" file is left
+// behind in the config directory afterward.
+func TestLocalFileSourceWriteCleansUpTempFileOnFailedRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	src := NewLocalFileSource(SourceRepoConfig, path)
+	if err := src.Write("proxy.target_url", "https://example.com"); err == nil {
+		t.Fatal("expected Write to fail when its rename target is a directory")
+	}
+
+	matches, err := filepath.Glob(filepath.Join(dir, "*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("expected no orphan temp file left behind after a failed rename, found %v", matches)
+	}
+}
+
+// TestLocalFileSourceWriteLeavesNoTempFileOnSuccess confirms the
+// happy path doesn't leave its own temp file behind either — only the
+// final config.toml should exist.
+func TestLocalFileSourceWriteLeavesNoTempFileOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	src := NewLocalFileSource(SourceRepoConfig, path)
+	if err := src.Write("proxy.target_url", "https://example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "config.toml" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("expected only config.toml in %s, found %v", dir, names)
 	}
 }
 

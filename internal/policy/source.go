@@ -163,14 +163,45 @@ func (l *LocalFileSource) Write(key string, value interface{}) error {
 	// userinfo) — the .centrol-rooted directory and the file itself must
 	// not be world-readable, matching the same bar applied to the ledger
 	// and session markers (internal/ledger.Open, internal/session).
-	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
+	dir := filepath.Dir(l.path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := l.path + ".tmp"
-	if err := os.WriteFile(tmp, writeTOMLSubset(doc), 0o600); err != nil {
+
+	// Audit fix (4d): a fixed ".tmp" suffix meant two concurrent writers
+	// (or a write racing `centrol proxy install`'s own rewrite of a
+	// different file) shared one temp path, and a failed rename left an
+	// orphan behind forever. os.CreateTemp gives this call its own
+	// randomly-named file, in the same directory as the real
+	// destination so the rename below stays same-filesystem (atomic);
+	// os.CreateTemp already creates it at 0600. removeTmp tracks
+	// whether cleanup is still needed — cleared only once the rename
+	// below actually succeeds, so every error path (write, close,
+	// rename) removes the temp file rather than leaving it on disk.
+	tmp, err := os.CreateTemp(dir, filepath.Base(l.path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, l.path)
+	tmpPath := tmp.Name()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmp.Write(writeTOMLSubset(doc)); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, l.path); err != nil {
+		return err
+	}
+	removeTmp = false
+	return nil
 }
 
 // DefaultSource is the lowest-priority source: centrol's own built-in
