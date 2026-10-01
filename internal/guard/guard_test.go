@@ -2,6 +2,8 @@ package guard
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -862,5 +864,136 @@ func TestRestoreNeverWritesToSystemTempDir(t *testing.T) {
 	}
 	if !info.IsDir() {
 		t.Fatalf("expected %s to be a directory", restoreTmpDir)
+	}
+}
+
+// captureStderr redirects os.Stderr for the duration of fn and returns
+// everything written to it. Used by the checkedEmit tests below, since
+// checkedEmit's warning (audit item 4b) is printed directly to
+// os.Stderr rather than through an injectable writer.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// TestCheckedEmitWarnsOnSingleFailure is the audit's 4b fix: a single
+// emit() failure must produce a visible stderr warning, and must NOT
+// by itself escalate to a policy.silence entry — that only happens
+// once failures persist (see the next test).
+func TestCheckedEmitWarnsOnSingleFailure(t *testing.T) {
+	repo := initRepo(t)
+	ignore, err := LoadIgnore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls int
+	var mu sync.Mutex
+	emit := func(run, src, typ string, payload map[string]interface{}) error {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return errors.New("synthetic ledger write failure")
+	}
+
+	w, err := NewWatcher(repo, "run-1", ignore, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	stderr := captureStderr(t, func() {
+		w.checkedEmit("fs.write", map[string]interface{}{"path": "a.go"})
+	})
+
+	if !strings.Contains(stderr, "warning") || !strings.Contains(stderr, "fs.write") {
+		t.Fatalf("expected a stderr warning naming the failed event type, got %q", stderr)
+	}
+
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("expected exactly 1 emit call for a single failure (no escalation yet), got %d", n)
+	}
+}
+
+// TestCheckedEmitEscalatesAfterThreeConsecutiveFailures confirms three
+// consecutive emit() failures — across any mix of call sites, tracked
+// by the same counter — escalate to one best-effort policy.silence
+// entry carrying the underlying error, and that the run is never
+// terminated by any of this (checkedEmit has no error return at all).
+func TestCheckedEmitEscalatesAfterThreeConsecutiveFailures(t *testing.T) {
+	repo := initRepo(t)
+	ignore, err := LoadIgnore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var types []string
+	emit := func(run, src, typ string, payload map[string]interface{}) error {
+		mu.Lock()
+		types = append(types, typ)
+		mu.Unlock()
+		if typ == "policy.silence" {
+			return nil // the escalation attempt itself succeeds
+		}
+		return errors.New("synthetic ledger write failure")
+	}
+
+	w, err := NewWatcher(repo, "run-1", ignore, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	_ = captureStderr(t, func() {
+		w.checkedEmit("fs.write", map[string]interface{}{"path": "a.go"})
+		w.checkedEmit("fs.write", map[string]interface{}{"path": "b.go"})
+		w.checkedEmit("fs.write", map[string]interface{}{"path": "c.go"})
+	})
+
+	mu.Lock()
+	got := append([]string(nil), types...)
+	mu.Unlock()
+
+	want := []string{"fs.write", "fs.write", "fs.write", "policy.silence"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected %v, got %v", want, got)
+		}
+	}
+
+	// The streak resets after escalating — a fourth, fresh failure must
+	// not immediately re-escalate.
+	_ = captureStderr(t, func() {
+		w.checkedEmit("fs.write", map[string]interface{}{"path": "d.go"})
+	})
+	mu.Lock()
+	got = append([]string(nil), types...)
+	mu.Unlock()
+	if len(got) != 5 || got[4] != "fs.write" {
+		t.Fatalf("expected the streak to have reset after escalating, got %v", got)
 	}
 }

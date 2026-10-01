@@ -1,6 +1,7 @@
 package guard
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,6 +79,72 @@ type Watcher struct {
 	debounceMu sync.Mutex
 	pending    map[string]*pendingFSEvent // keyed by repo-relative path; one in-flight debounce window per path
 	debounceWG sync.WaitGroup             // outstanding debounce timers — Close waits for these to flush before returning
+
+	// emitFailureMu/emitFailureStreak track CONSECUTIVE emit() failures
+	// across every call site in this file (emitDebounced's immediate
+	// and debounced paths, flushAllPending, scanExisting, handle's own
+	// policy.violation emits) — audit fix (4b). Every emit() call used
+	// to go out as `_ = w.emit(...)`, discarding its error entirely: a
+	// guarded run whose ledger writes started silently failing (a full
+	// disk, a permissions change mid-run) produced no record of ANY
+	// filesystem activity for the rest of the run, with nothing printed
+	// and nothing logged — the run would look clean when it wasn't
+	// observing anything at all. Reset to 0 by any successful emit.
+	emitFailureMu     sync.Mutex
+	emitFailureStreak int
+}
+
+// emitFailureEscalateAt is how many consecutive emit() failures (see
+// checkedEmit) trigger an escalation to a policy.silence ledger entry,
+// rather than just a stderr warning. A single failure is often
+// transient; three in a row across whatever this watcher is observing
+// is treated as the ledger itself being unavailable for the rest of
+// the run, which the run's own audit trail must reflect.
+const emitFailureEscalateAt = 3
+
+// checkedEmit wraps every call this file makes through EmitFunc.
+// Unlike the discarded-error calls it replaces, a failure here always
+// prints a warning to stderr (so a human watching the run sees it
+// immediately, even though the Watcher has no logger of its own to
+// gate output by --quiet/--verbose) and, once emitFailureEscalateAt
+// consecutive failures have been observed across any combination of
+// call sites, makes one best-effort attempt to record a policy.silence
+// entry carrying the underlying error — so the run's own ledger, if it
+// has recovered enough to accept writes again, shows that observation
+// was degraded for part of the run, rather than silently resuming as
+// if nothing had happened. checkedEmit never returns an error and
+// never terminates the run: a broken ledger is not a reason to stop
+// observing or to kill the wrapped agent.
+func (w *Watcher) checkedEmit(typ string, payload map[string]interface{}) {
+	err := w.emit(w.runID, "guard", typ, payload)
+	if err == nil {
+		w.emitFailureMu.Lock()
+		w.emitFailureStreak = 0
+		w.emitFailureMu.Unlock()
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "centrol guard: warning: failed to log %s event: %v\n", typ, err)
+
+	w.emitFailureMu.Lock()
+	w.emitFailureStreak++
+	streak := w.emitFailureStreak
+	if streak >= emitFailureEscalateAt {
+		w.emitFailureStreak = 0
+	}
+	w.emitFailureMu.Unlock()
+
+	if streak >= emitFailureEscalateAt {
+		// Best-effort: if the ledger is still unavailable, this fails
+		// too and is silently dropped — there is nothing further to do
+		// beyond the stderr warning already printed above for every
+		// failure in the streak, including this one.
+		_ = w.emit(w.runID, "guard", "policy.silence", map[string]interface{}{
+			"reason":      "repeated watcher emit failures",
+			"failed_type": typ,
+			"error":       err.Error(),
+		})
+	}
 }
 
 // pendingFSEvent is the most recent event observed for one path during
@@ -166,7 +233,7 @@ func (w *Watcher) Close() error {
 // once debounce elapses with no further event for that same path.
 func (w *Watcher) emitDebounced(typ, relSlash string, payload map[string]interface{}) {
 	if w.debounce <= 0 {
-		_ = w.emit(w.runID, "guard", typ, payload)
+		w.checkedEmit(typ, payload)
 		return
 	}
 
@@ -203,7 +270,7 @@ func (w *Watcher) emitDebounced(typ, relSlash string, payload map[string]interfa
 		}
 		delete(w.pending, relSlash)
 		w.debounceMu.Unlock()
-		_ = w.emit(w.runID, "guard", cur.typ, cur.payload)
+		w.checkedEmit(cur.typ, cur.payload)
 	})
 	w.pending[relSlash] = pe
 	w.debounceMu.Unlock()
@@ -232,7 +299,7 @@ func (w *Watcher) flushAllPending() {
 		if pe.timer.Stop() {
 			w.debounceWG.Done()
 		}
-		_ = w.emit(w.runID, "guard", pe.typ, pe.payload)
+		w.checkedEmit(pe.typ, pe.payload)
 	}
 }
 
@@ -279,7 +346,7 @@ func (w *Watcher) scanExisting(root string) {
 			return nil
 		}
 		if !inside {
-			_ = w.emit(w.runID, "guard", "policy.violation", map[string]interface{}{
+			w.checkedEmit("policy.violation", map[string]interface{}{
 				"reason": "symlink escape: path resolves outside repo root",
 				"path":   relSlash,
 				"target": real,
@@ -287,7 +354,7 @@ func (w *Watcher) scanExisting(root string) {
 			return nil
 		}
 
-		_ = w.emit(w.runID, "guard", "fs.create", map[string]interface{}{"path": relSlash})
+		w.checkedEmit("fs.create", map[string]interface{}{"path": relSlash})
 		return nil
 	})
 }
@@ -331,7 +398,7 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 		// Symlink (or the path itself) resolves outside the repo root.
 		// Refuse to follow it; record as a policy violation rather than
 		// silently dropping it.
-		_ = w.emit(w.runID, "guard", "policy.violation", map[string]interface{}{
+		w.checkedEmit("policy.violation", map[string]interface{}{
 			"reason": "symlink escape: path resolves outside repo root",
 			"path":   filepath.ToSlash(mustRel(w.repoRoot, absPath)),
 			"target": real,
