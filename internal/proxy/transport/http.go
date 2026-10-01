@@ -32,6 +32,33 @@ const maxJSONResponseBytes = 16 * 1024 * 1024
 // independent of the operator-configured Timeout field.
 const deleteTimeout = 5 * time.Second
 
+// maxRedirects bounds how many redirects checkRedirectPolicy will
+// follow before refusing outright, regardless of host.
+const maxRedirects = 3
+
+// checkRedirectPolicy is installed as http.Client.CheckRedirect on the
+// default client httpClient() constructs. Audit fix (5a): without this,
+// Go's default redirect handling follows a target's redirect to any
+// host and forwards every request header except a fixed, hardcoded
+// "sensitive" set (Authorization, Cookie, ...) — Mcp-Session-Id is a
+// custom header carrying this target's own session state and is not in
+// that set, so an unconstrained redirect could replay it verbatim to an
+// entirely different, attacker-controlled host. Returning a non-nil
+// error here stops Client.Do from ever sending the redirected request
+// at all, so a refused cross-host redirect means the header is never
+// transmitted there. Same-host redirects (same scheme, host, and port)
+// are allowed, up to maxRedirects.
+func checkRedirectPolicy(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("proxy: target issued more than %d redirects", maxRedirects)
+	}
+	orig := via[0].URL
+	if !strings.EqualFold(req.URL.Scheme, orig.Scheme) || !strings.EqualFold(req.URL.Host, orig.Host) {
+		return fmt.Errorf("proxy: refusing cross-host redirect from %s to %s", orig.Host, req.URL.Host)
+	}
+	return nil
+}
+
 // ErrHTTPTimeout marks an HTTPTarget.Send failure as the configured
 // per-request timeout expiring (Timeout, or the context passed to
 // Start running out), distinct from other transport errors, so a
@@ -532,7 +559,7 @@ func (t *HTTPTarget) httpClient() *http.Client {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.Client == nil {
-		t.Client = &http.Client{}
+		t.Client = &http.Client{CheckRedirect: checkRedirectPolicy}
 	}
 	return t.Client
 }

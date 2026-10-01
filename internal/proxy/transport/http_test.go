@@ -890,3 +890,123 @@ func TestHTTPTargetRejectsOversizedJSONResponseBody(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// TestHTTPTargetRefusesCrossHostRedirect is the audit's 5a fix:
+// Mcp-Session-Id is a custom header that Go's default redirect handling
+// would otherwise forward to any host the target redirects to (only a
+// fixed set of "sensitive" headers like Authorization/Cookie are
+// stripped cross-host, and Mcp-Session-Id isn't one of them). This
+// confirms a cross-host redirect is refused outright — Send returns an
+// error and the redirect target never receives the request at all, so
+// the session header is never transmitted there.
+func TestHTTPTargetRefusesCrossHostRedirect(t *testing.T) {
+	var otherSrvHit bool
+	var mu sync.Mutex
+	otherSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		otherSrvHit = true
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	}))
+	defer otherSrv.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, otherSrv.URL+"/", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL, SessionID: "secret-session-id"}
+	if err := target.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := target.Receive(); err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+
+	err := target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`))
+	if err == nil {
+		t.Fatal("expected Send to fail when the target issues a cross-host redirect")
+	}
+	if !strings.Contains(err.Error(), "cross-host") {
+		t.Fatalf("expected a cross-host redirect error, got: %v", err)
+	}
+
+	mu.Lock()
+	hit := otherSrvHit
+	mu.Unlock()
+	if hit {
+		t.Fatal("expected the cross-host redirect target to never receive a request — the session header would have been replayed to it")
+	}
+}
+
+// TestHTTPTargetFollowsSameHostRedirect confirms the fix doesn't break
+// the ordinary case: a redirect to the same scheme+host+port is
+// followed and the response is forwarded normally.
+func TestHTTPTargetFollowsSameHostRedirect(t *testing.T) {
+	var sessionHeaderOnSecondRequest string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/after-redirect" {
+			sessionHeaderOnSecondRequest = r.Header.Get("Mcp-Session-Id")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"ok":true}}`))
+			return
+		}
+		http.Redirect(w, r, "/after-redirect", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL, SessionID: "same-host-session-id"}
+	if err := target.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ch, err := target.Receive()
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`))
+	}()
+
+	frame := drainOne(t, ch)
+	if err := <-sendErr; err != nil {
+		t.Fatalf("Send returned an error for a same-host redirect: %v", err)
+	}
+	var env map[string]interface{}
+	if err := json.Unmarshal(frame, &env); err != nil {
+		t.Fatalf("forwarded frame is not valid JSON: %v (%s)", err, frame)
+	}
+	if sessionHeaderOnSecondRequest != "same-host-session-id" {
+		t.Fatalf("expected the session header to still be sent on a same-host redirect, got %q", sessionHeaderOnSecondRequest)
+	}
+}
+
+// TestHTTPTargetRefusesMoreThanMaxRedirects confirms the redirect cap
+// itself, independent of host: a target that keeps redirecting
+// same-host forever must eventually be refused rather than followed
+// indefinitely.
+func TestHTTPTargetRefusesMoreThanMaxRedirects(t *testing.T) {
+	var hits int
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits++
+		n := hits
+		mu.Unlock()
+		http.Redirect(w, r, fmt.Sprintf("/hop-%d", n), http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	_, _ = target.Receive()
+
+	err := target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`))
+	if err == nil {
+		t.Fatal("expected Send to fail once the redirect count exceeds the cap")
+	}
+}
