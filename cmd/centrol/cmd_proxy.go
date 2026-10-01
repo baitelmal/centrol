@@ -484,14 +484,37 @@ func cmdProxyRun(args []string) {
 	}
 	close(stopScope)
 
+	// Audit fix (4a): g.Cause()/g.ExitCode() are the Governor's own
+	// record of what actually happened during Run — including a
+	// recovered goroutine panic, which Run() now surfaces as its
+	// returned error too (see Run's own doc comment), but which this
+	// function must not rely on runErr alone to detect. The reason is
+	// endRun's own first-call-wins contract (see its doc comment in
+	// summary.go): the panicking goroutine already called g.Stop
+	// directly, deep inside Run, with no access to this function's
+	// printRunSummary/ledger machinery and no printMsg of its own — so
+	// the end() call below is guaranteed to LOSE that race, and a
+	// losing call's printMsg is dropped entirely. Left unhandled, that
+	// means a panic's "cause" and "exit code" would still end up
+	// correct (first-call-wins already recorded them), but the operator
+	// would never see why. Checking cause directly here, before calling
+	// end, is the only remaining place that can print that explanation.
+	cause := g.Cause()
 	endPayload := map[string]interface{}{}
 	if runErr != nil {
 		endPayload["error"] = runErr.Error()
+	}
+	if cause != "" {
+		endPayload["cause"] = cause
 	}
 	if errors.Is(runErr, proxy.ErrStreamRead) {
 		counters.markStreamError()
 	}
 	_ = emit(runID, "proxy", "run.end", endPayload)
+
+	if cause == "panic" {
+		fmt.Fprintf(os.Stderr, "centrol proxy: agent run panicked (exit code %d): %v\n", g.ExitCode(), runErr)
+	}
 
 	// end prints the run summary and clears the marker on every
 	// trappable exit from here: normal completion, and the runErr branch

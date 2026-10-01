@@ -852,6 +852,79 @@ func TestGovernorRunRecoversPumpPanic(t *testing.T) {
 	}
 }
 
+// sendPanicTarget triggers a synthetic panic inside Governor.Run's
+// client->target pump goroutine specifically (Send panics), with
+// Receive returning an already-closed channel so the target->client
+// pump ends cleanly with a nil error on its own, and Stop succeeding
+// normally — unlike panicTarget above, every OTHER signal Run reads
+// (drainErr, waitErr, stopErr) is nil, so this isolates the audit's 4a
+// gap: that pump's own recover calls Stop("panic", 2) but has no error
+// channel of its own to report on (see Run's doc comment on the
+// client->target goroutine), so before the 4a fix Run returned nil
+// here even though a goroutine inside it had panicked.
+// sendPanicTarget's Receive channel is deliberately gated on Stop, the
+// same way cancelTarget's is — not pre-closed — so this test exercises
+// the real causal chain a live target goes through: the target->client
+// pump cannot end (and so Run's drainErr cannot resolve) until Stop
+// closes the channel, and Stop is only ever reached, in this scenario,
+// via the clientPumpDone-watching goroutine noticing the client->target
+// pump ended. That is what makes the 4a ordering fix (clientPumpDone
+// sent only after the panic's own recover has already called
+// g.Stop("panic", 2)) actually observable here, rather than racing it
+// the way a pre-closed channel would.
+type sendPanicTarget struct {
+	ch chan []byte
+}
+
+func newSendPanicTarget() *sendPanicTarget {
+	return &sendPanicTarget{ch: make(chan []byte)}
+}
+
+func (s *sendPanicTarget) Start(ctx context.Context) error { return nil }
+func (s *sendPanicTarget) Send(frame []byte) error {
+	panic("synthetic panic for TestGovernorRunSurfacesClientToTargetPumpPanic")
+}
+func (s *sendPanicTarget) Receive() (<-chan []byte, error) { return s.ch, nil }
+func (s *sendPanicTarget) Stop() error {
+	close(s.ch)
+	return nil
+}
+
+func TestGovernorRunSurfacesClientToTargetPumpPanic(t *testing.T) {
+	rec := &recorder{}
+	in := proxy.NewInterceptor("run-panic-2", testContract(), rec.emit, nil, true)
+
+	line := toolCallLine(t, "1", "read_file", map[string]interface{}{"path": "a.go"})
+	clientIn := strings.NewReader(string(line) + "\n")
+	clientOut := &safeBuffer{}
+	diag := &safeBuffer{}
+
+	g := &Governor{}
+	st := newSendPanicTarget()
+	var runErr error
+	done := make(chan struct{})
+	go func() {
+		runErr = g.Run(context.Background(), st, in, clientIn, clientOut, diag)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Governor.Run did not return after a client->target pump panic")
+	}
+
+	if runErr == nil {
+		t.Fatal("expected Governor.Run to return a non-nil error after a client->target pump panic (audit 4a)")
+	}
+	if got := g.Cause(); got != "panic" {
+		t.Fatalf(`expected Governor.Cause() == "panic" after a client->target pump panic, got %q`, got)
+	}
+	if got := g.ExitCode(); got != 2 {
+		t.Fatalf("expected Governor.ExitCode() == 2 after a client->target pump panic, got %d", got)
+	}
+}
+
 // cancelTarget blocks Receive() until Stop() is called, then closes
 // its receive channel — mirroring how a real RunTransport's Stop
 // actually ends the target->client pump's loop. minimalTarget

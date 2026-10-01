@@ -546,25 +546,38 @@ func (g *Governor) Run(ctx context.Context, target RunTransport, in *proxy.Inter
 
 	// client -> target
 	go func() {
-		// Top-level recover (Pass 3.9c Final, Section 2 "Panics"): Go
-		// does not propagate a panic across goroutines, so without this
-		// a bug here would crash the whole process outside the
-		// Governor's knowledge. Deferred first (runs last, after the
-		// clientPumpDone send below) so it still catches a panic that
-		// happens inside that same deferred send — recover only needs to
-		// be called from some deferred function in the panicking frame,
-		// not the first one.
-		defer func() {
-			if r := recover(); r != nil {
-				g.Stop("panic", 2)
-			}
-		}()
 		// Reports upward that this pump's own loop has ended, for
 		// whatever reason — "no more input is coming." It does NOT call
 		// targetStop() itself (Pass 3.9 Section 3): that decision belongs
 		// to this function's own body (see the clientPumpDone-watching
 		// goroutine below), not to the pump.
+		//
+		// Registered BEFORE the recover defer below (audit fix 4a): Go
+		// runs deferred calls LIFO, so the recover defer — registered
+		// second, and so run FIRST — gets first claim on any panic, and
+		// only after it has recorded that outcome via g.Stop("panic", 2)
+		// does this send run. Without that ordering, nothing downstream
+		// of clientPumpDone (the fallback goroutine that calls
+		// targetStop(), and in turn the target side's own shutdown)
+		// could ever be sure g.Cause() already reflects a panic by the
+		// time it observes clientPumpDone — which is exactly the
+		// ordering Run's own final Cause() check, and cmd_proxy.go's
+		// check after Run returns, both depend on.
 		defer func() { clientPumpDone <- struct{}{} }()
+		// Top-level recover (Pass 3.9c Final, Section 2 "Panics"): Go
+		// does not propagate a panic across goroutines, so without this
+		// a bug here would crash the whole process outside the
+		// Governor's knowledge. recover() stays effective regardless of
+		// defer order — it catches whatever panic is unwinding this
+		// goroutine no matter which deferred call invokes it — so
+		// registering this one last (making it run first) only changes
+		// the ORDER the other defers in this function see, not whether
+		// this one catches the panic.
+		defer func() {
+			if r := recover(); r != nil {
+				g.Stop("panic", 2)
+			}
+		}()
 		clientLines, clientReadErr := proxy.ReadFrames(clientIn)
 		for line := range clientLines {
 			forward, fwdLine, blockResp, err := in.HandleClientRequest(line)
@@ -765,16 +778,36 @@ func (g *Governor) Run(ctx context.Context, target RunTransport, in *proxy.Inter
 	// (a live MCP client's stdin may stay open long after the target it
 	// was talking to exits), so this check stays non-blocking: pick up an
 	// error if the goroutine already finished, but never wait on it here.
+	var pumpErr error
 	select {
-	case pumpErr := <-clientToTargetErr:
-		if pumpErr != nil {
-			return pumpErr
-		}
+	case pumpErr = <-clientToTargetErr:
 	default:
 	}
 
-	if waitErr != nil {
+	switch {
+	case pumpErr != nil:
+		return pumpErr
+	case waitErr != nil:
 		return waitErr
+	case stopErr != nil:
+		return stopErr
 	}
-	return stopErr
+
+	// Audit fix (4a): every path above only returns non-nil when one of
+	// the pumps' own error channels, Wait(), or targetStop() itself
+	// reported a failure. A panic recovered in the client->target pump
+	// (the recover at the top of that goroutine, above) calls
+	// g.Stop("panic", 2) but — unlike the target->client pump's own
+	// recover — has nothing to send an error on: clientPumpDone only
+	// ever carries "no more input," never an error. So if the rest of
+	// the run finished cleanly (the target exited, Stop/Wait reported
+	// no error), Run used to return nil even though a goroutine inside
+	// it had panicked. Checking Cause() here, after every other, more
+	// specific error has had its chance to win, means a panic the
+	// pumps' own channels failed to surface is never silently treated
+	// as a successful run.
+	if g.Cause() == "panic" {
+		return fmt.Errorf("governor: run panicked (exit code %d)", g.ExitCode())
+	}
+	return nil
 }
