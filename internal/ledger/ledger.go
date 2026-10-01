@@ -492,42 +492,149 @@ func (l *Ledger) Verify() (VerifyResult, error) {
 	return res, nil
 }
 
-// Tail returns up to n most recent entries across all segments, in
-// chronological order, for `centrol audit` / `centrol status`.
+// readAllEntries scans segPath start to finish, parsing every
+// non-empty line as an Entry. Used only by Tail's n<=0 ("everything")
+// case, where reading the whole segment is unavoidable — that's what
+// was asked for.
+func readAllEntries(segPath string) ([]Entry, error) {
+	f, err := os.Open(segPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	var out []Entry
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var e Entry
+		if err := json.Unmarshal(line, &e); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// readLastLines reads the last up-to-limit non-empty lines of path,
+// scanning backward from the end in growing chunks — the same
+// approach lastEntry already uses for a single line, generalized to
+// stop once enough lines are buffered rather than always continuing
+// to the start of the file. Cost is bounded by limit and the file's
+// own line lengths, not by the file's total size, unless the file
+// itself has fewer than limit lines (in which case reading the whole
+// thing is unavoidable). Returns the lines in on-disk (forward) order.
+func readLastLines(path string, limit int) ([][]byte, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := stat.Size()
+	if size == 0 {
+		return nil, nil
+	}
+
+	const chunkSize = 64 * 1024
+	var buf []byte
+	pos := size
+	for {
+		readSize := int64(chunkSize)
+		if readSize > pos {
+			readSize = pos
+		}
+		pos -= readSize
+		part := make([]byte, readSize)
+		if _, err := f.ReadAt(part, pos); err != nil && err != io.EOF {
+			return nil, err
+		}
+		buf = append(part, buf...)
+
+		// bytes.TrimRight drops the file's own trailing newline so it
+		// isn't counted as an extra, empty final line; once the
+		// buffer holds at least `limit` newlines, it holds at least
+		// `limit` complete lines (the segment ending at pos==size is
+		// always complete), and once pos==0 nothing further can be
+		// read regardless of count.
+		if pos == 0 || bytes.Count(bytes.TrimRight(buf, "\n"), []byte("\n")) >= limit {
+			break
+		}
+	}
+
+	var lines [][]byte
+	for _, raw := range bytes.Split(bytes.TrimRight(buf, "\n"), []byte("\n")) {
+		if len(bytes.TrimSpace(raw)) == 0 {
+			continue
+		}
+		lines = append(lines, raw)
+	}
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+	return lines, nil
+}
+
+// Tail returns the last n entries across every segment, oldest first.
+// n<=0 returns every entry in the ledger.
 func (l *Ledger) Tail(n int) ([]Entry, error) {
 	segs, err := l.segments()
 	if err != nil {
 		return nil, err
 	}
-	var all []Entry
-	for _, segPath := range segs {
-		f, err := os.Open(segPath)
+
+	if n <= 0 {
+		var all []Entry
+		for _, segPath := range segs {
+			entries, err := readAllEntries(segPath)
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, entries...)
+		}
+		return all, nil
+	}
+
+	// Audit fix (4c): this used to load every entry from every segment
+	// into memory before trimming to the last n, regardless of how
+	// small n was relative to a long-lived, never-pruned ledger. Walk
+	// segments newest-to-oldest instead, asking each one for only as
+	// many of its own last lines as are still needed, and stop as soon
+	// as n entries have been collected.
+	var collected []Entry
+	for i := len(segs) - 1; i >= 0 && len(collected) < n; i-- {
+		need := n - len(collected)
+		lines, err := readLastLines(segs[i], need)
 		if err != nil {
 			return nil, err
 		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			if len(bytes.TrimSpace(line)) == 0 {
-				continue
-			}
+		seg := make([]Entry, 0, len(lines))
+		for _, line := range lines {
 			var e Entry
 			if err := json.Unmarshal(line, &e); err != nil {
-				f.Close()
 				return nil, err
 			}
-			all = append(all, e)
+			seg = append(seg, e)
 		}
-		f.Close()
-		if err := scanner.Err(); err != nil {
-			return nil, err
-		}
+		collected = append(seg, collected...)
 	}
-	if n > 0 && len(all) > n {
-		all = all[len(all)-n:]
-	}
-	return all, nil
+	return collected, nil
 }
 
 // LastHashSeq returns the current chain head (hash, seq) so a caller

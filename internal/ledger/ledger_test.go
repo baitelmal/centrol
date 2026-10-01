@@ -283,6 +283,115 @@ func TestRotationSealAndCrossSegmentVerify(t *testing.T) {
 	}
 }
 
+// TestTailSmallNReturnsCorrectEntriesAcrossManySegments is a
+// correctness check for the audit's 4c fix: Tail no longer loads every
+// segment before trimming, so this confirms the newest-to-oldest,
+// per-segment backward read still produces exactly the right last-N
+// entries, in the right order, when they span several segments.
+func TestTailSmallNReturnsCorrectEntriesAcrossManySegments(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(filepath.Join(dir, "lighthouse.jsonl"), 1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	l.rotateAtBytes = 300 // force several small segments, same as TestRotationSealAndCrossSegmentVerify
+
+	const total = 80
+	for i := 0; i < total; i++ {
+		mustAppend(t, l, "run-tail", "guard", "fs.write", map[string]interface{}{"i": i})
+	}
+	segs, err := l.segments()
+	if err != nil {
+		t.Fatalf("segments: %v", err)
+	}
+	if len(segs) < 3 {
+		t.Fatalf("expected at least 3 segments to make this a real cross-segment test, got %d", len(segs))
+	}
+
+	all, err := l.Tail(0)
+	if err != nil {
+		t.Fatalf("Tail(0): %v", err)
+	}
+
+	for _, n := range []int{1, 5, 17, len(all), len(all) + 10} {
+		got, err := l.Tail(n)
+		if err != nil {
+			t.Fatalf("Tail(%d): %v", n, err)
+		}
+		want := all
+		if n > 0 && len(all) > n {
+			want = all[len(all)-n:]
+		}
+		if len(got) != len(want) {
+			t.Fatalf("Tail(%d): got %d entries, want %d", n, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Seq != want[i].Seq || got[i].Hash != want[i].Hash {
+				t.Fatalf("Tail(%d)[%d]: got seq=%d hash=%s, want seq=%d hash=%s", n, i, got[i].Seq, got[i].Hash, want[i].Seq, want[i].Hash)
+			}
+		}
+	}
+}
+
+// TestTailSmallNNeverReadsOlderSegments proves Tail(n) for a small n
+// never opens segments older than the ones needed to satisfy n: an
+// old, already-rotated-away segment is overwritten with corrupt JSON
+// after the fact (which Tail would error on if it ever parsed it), and
+// a small Tail(n) covering only the most recent entries must still
+// succeed cleanly.
+func TestTailSmallNNeverReadsOlderSegments(t *testing.T) {
+	dir := t.TempDir()
+	l, err := Open(filepath.Join(dir, "lighthouse.jsonl"), 1)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	l.rotateAtBytes = 300
+
+	const total = 80
+	for i := 0; i < total; i++ {
+		mustAppend(t, l, "run-tail", "guard", "fs.write", map[string]interface{}{"i": i})
+	}
+	segs, err := l.segments()
+	if err != nil {
+		t.Fatalf("segments: %v", err)
+	}
+	if len(segs) < 3 {
+		t.Fatalf("expected at least 3 segments, got %d", len(segs))
+	}
+
+	// Capture the true last 3 entries before corrupting anything.
+	want, err := l.Tail(3)
+	if err != nil {
+		t.Fatalf("Tail(3) before corruption: %v", err)
+	}
+
+	// Corrupt the OLDEST segment only — if Tail(n) for a small n ever
+	// opens it, json.Unmarshal fails and Tail returns an error.
+	if err := os.WriteFile(segs[0], []byte("not json at all\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := l.Tail(3)
+	if err != nil {
+		t.Fatalf("Tail(3) should never have touched the corrupted oldest segment, got error: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(got))
+	}
+	for i := range want {
+		if got[i].Seq != want[i].Seq || got[i].Hash != want[i].Hash {
+			t.Fatalf("entry %d changed after corrupting the oldest segment: got seq=%d hash=%s, want seq=%d hash=%s", i, got[i].Seq, got[i].Hash, want[i].Seq, want[i].Hash)
+		}
+	}
+
+	// A full Tail(0) still sees — and fails on — the corruption, proving
+	// the small-n path above really did skip it rather than the
+	// corruption being harmless for some other reason.
+	if _, err := l.Tail(0); err == nil {
+		t.Fatalf("expected Tail(0) to fail on the corrupted oldest segment (sanity check that it's genuinely corrupt)")
+	}
+}
+
 // TestResumeAfterRestart confirms LastHashSeq lets a fresh Ledger handle
 // (simulating a new process) continue the chain correctly.
 func TestResumeAfterRestart(t *testing.T) {
