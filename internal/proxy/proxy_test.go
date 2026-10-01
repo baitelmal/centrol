@@ -156,6 +156,49 @@ func TestFlaggedCallWithNoPromptAutoDenies(t *testing.T) {
 	}
 }
 
+// TestInterceptorConsultsLiveContractOnEachCall guards against the
+// asymmetry between proxy and guard that the Pass 0.5 comment on
+// cmd_proxy.go used to document as deferred: guard's watcher path
+// (contractAwareEmit) calls gc.get() fresh on every fs event, so a
+// mid-run `centrol scope +<path>` takes effect immediately there.
+// Interceptor must now do the same for tools/call evaluation when
+// ContractFunc is set — the mechanism cmd_proxy.go wires it through.
+func TestInterceptorConsultsLiveContractOnEachCall(t *testing.T) {
+	rec := &recorder{}
+	c := policy.Contract{Kind: policy.KindProxy, TaskID: "run-1", RepoRoot: "/repo", AllowedPaths: []string{"src"}, MassMutationThreshold: 20}
+	in := NewInterceptor("run-1", c, rec.emit, nil, true) // Prompt is nil: FLAG auto-denies
+
+	// Out of scope before any amendment: FLAG tier with no interactive
+	// prompt auto-denies (fail closed), same as
+	// TestFlaggedCallWithNoPromptAutoDenies above.
+	line1 := toolCallLine(t, "1", "write_file", map[string]interface{}{"path": "docs/readme.md"})
+	forward1, _, block1, err := in.HandleClientRequest(line1)
+	if err != nil {
+		t.Fatalf("HandleClientRequest: %v", err)
+	}
+	if forward1 || block1 == nil {
+		t.Fatalf("expected the out-of-scope call to be denied before any scope amendment")
+	}
+
+	// Simulate a mid-run `centrol scope +docs` amendment the way
+	// cmd_proxy.go's guardedContract.amend does: widen a contract value
+	// held outside the Interceptor, and point ContractFunc at it — the
+	// Interceptor's own static Contract field is deliberately left
+	// untouched, to prove evaluation reads through ContractFunc rather
+	// than the stale snapshot NewInterceptor captured.
+	c.AmendScope("docs")
+	in.ContractFunc = func() policy.Contract { return c }
+
+	line2 := toolCallLine(t, "2", "write_file", map[string]interface{}{"path": "docs/readme.md"})
+	forward2, _, block2, err := in.HandleClientRequest(line2)
+	if err != nil {
+		t.Fatalf("HandleClientRequest: %v", err)
+	}
+	if !forward2 || block2 != nil {
+		t.Fatalf("expected the scope amendment to take effect on the very next tools/call (live contract), got forward=%v block=%v", forward2, block2)
+	}
+}
+
 func TestFlaggedCallAllowOnceForwardsButDoesNotGrantSession(t *testing.T) {
 	rec := &recorder{}
 	c := policy.Contract{Kind: policy.KindProxy, TaskID: "run-1", RepoRoot: "/repo", AllowedPaths: []string{"src"}, MassMutationThreshold: 20}

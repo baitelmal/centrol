@@ -135,8 +135,24 @@ func WriteFrame(w io.Writer, b []byte) error {
 // traffic for one run: the session contract, the Governor emit hook,
 // the interactive prompt hook, and per-tool "allow session" grants.
 type Interceptor struct {
-	RunID             string
-	Contract          policy.Contract
+	RunID string
+	// Contract is the fixed value NewInterceptor was given. Tool-call
+	// evaluation never reads this field directly — see ContractFunc and
+	// contract() — but it remains the value ContractFunc's default
+	// closure returns, and the zero-arg construction path (nil
+	// ContractFunc) tests rely on.
+	Contract policy.Contract
+	// ContractFunc, when set, is consulted fresh on every tools/call
+	// evaluation instead of the static Contract field — the same "call
+	// gc.get() fresh each time" pattern contractAwareEmit uses for
+	// guard's watcher path (cmd/centrol/contract_runtime.go). proxy.Run
+	// and proxy.RunTarget's caller (cmd/centrol/cmd_proxy.go) sets this
+	// to the run's live *guardedContract.get, so a mid-run `centrol
+	// scope +<path>` takes effect on the very next tools/call, matching
+	// guard. NewInterceptor leaves this nil, so a caller that never sets
+	// it (every existing test) gets the old fixed-snapshot behavior via
+	// contract()'s fallback.
+	ContractFunc      func() policy.Contract
 	Emit              EmitFunc
 	Prompt            PromptFunc
 	AllowSessionAmend bool // enterprise-configurable; false disables "Allow session"
@@ -172,6 +188,17 @@ type Interceptor struct {
 type pendingCall struct {
 	tool  string
 	timer *time.Timer
+}
+
+// contract returns the contract value this call's policy evaluation
+// should use: ContractFunc(), if set, otherwise the static Contract
+// field. See ContractFunc's doc comment on Interceptor for why this
+// indirection exists.
+func (in *Interceptor) contract() policy.Contract {
+	if in.ContractFunc != nil {
+		return in.ContractFunc()
+	}
+	return in.Contract
 }
 
 func NewInterceptor(runID string, contract policy.Contract, emit EmitFunc, prompt PromptFunc, allowSessionAmend bool) *Interceptor {
@@ -332,14 +359,15 @@ func (in *Interceptor) HandleClientRequest(line []byte) (forward bool, forwardLi
 		_ = json.Unmarshal(env.Params, &params)
 	}
 
-	args := extractToolCallArgs(params, in.Contract)
-	tier, reason := policy.EvaluateToolCall(args, in.Contract)
+	liveContract := in.contract()
+	args := extractToolCallArgs(params, liveContract)
+	tier, reason := policy.EvaluateToolCall(args, liveContract)
 
 	// Mass-mutation check layers on top of the per-path tier: a call can
 	// individually address in-scope files yet still touch more of them
 	// than the contract's threshold.
 	if tier == policy.Allow {
-		if mTier, mReason := policy.EvaluateMassMutation(len(args.PathArgs), in.Contract); mTier != policy.Allow {
+		if mTier, mReason := policy.EvaluateMassMutation(len(args.PathArgs), liveContract); mTier != policy.Allow {
 			tier, reason = mTier, mReason
 		}
 	}

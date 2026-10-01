@@ -329,22 +329,15 @@ func cmdProxyRun(args []string) {
 	interceptor := proxy.NewInterceptor(runID, gc.get(), emit, prompt, allowSessionAmend)
 	interceptor.Observe = observe
 	interceptor.MCPCallTimeout = time.Duration(mcpCallTimeoutSec) * time.Second
-	// The interceptor snapshots the contract once at construction;
-	// tools/call evaluation therefore doesn't see later `centrol scope`
-	// amendments within the same run in v0.1. Widening this to consult
-	// gc live is a small follow-up, not a redesign: EvaluateToolCall's
-	// signature already takes a Contract by value.
-	//
-	// This is an asymmetry with `centrol guard`: guard's watcher path
-	// evaluates through contractAwareEmit (contract_runtime.go), which
-	// calls gc.get() fresh on every fs event, so a mid-run `centrol
-	// scope +<path>` takes effect immediately there. proxy's Interceptor
-	// has no equivalent — it only ever sees the Contract value handed to
-	// NewInterceptor below, so the same scope amendment is silently
-	// inert for tools/call policy decisions in this run. See
-	// internal/proxy/proxy.go's denialSuggestion, which is worded to not
-	// imply otherwise. Fixing this (making Interceptor consult gc live,
-	// the same way guard does) is a v0.2.x follow-up, not done here.
+	// ContractFunc makes tools/call evaluation consult gc fresh on every
+	// call, the same way guard's contractAwareEmit (contract_runtime.go)
+	// calls gc.get() fresh on every fs event — so a mid-run `centrol
+	// scope +<path>` takes effect on the very next tools/call here, just
+	// as it already does for guard's watcher path. The NewInterceptor
+	// call above still passes gc.get() as Contract's initial value,
+	// which only matters if ContractFunc is ever unset; with it set,
+	// every evaluation in this run reads through gc instead.
+	interceptor.ContractFunc = gc.get
 
 	// Unlike centrol guard (which hands signal responsibility to
 	// terminal.Run's own forwarding once the wrapped agent starts),
