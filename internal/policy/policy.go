@@ -258,6 +258,24 @@ func EvaluateFSPath(relPath string, c Contract) (Tier, string) {
 	if strings.Contains(relPath, "..") {
 		return Block, "path traversal outside repo root"
 	}
+	// Audit fix: ProtectedPaths's own doc comment says "guard and proxy
+	// both consult this," but this function never did — only
+	// EvaluateToolCall (proxy's tool-call evaluator) checked it. Since
+	// every path reaching here is already repo-relative, the built-in
+	// defaults (/etc, /root, ~/.ssh, ~/.aws) can only ever match here if
+	// the repo itself is nested under one of them; the practical case
+	// this closes is an operator-configured proxy.additional_block_paths
+	// entry that points inside the repo (e.g. a secrets/ directory),
+	// which was silently unenforced under `centrol guard`. Same
+	// canonical-to-canonical comparison as EvaluateToolCall, and checked
+	// before scope for the same reason: a hard block always outranks a
+	// flag, regardless of whether the path is otherwise in scope.
+	candidate := canonicalizeCandidate(relPath, c.RepoRoot)
+	for _, blocked := range c.ProtectedPaths {
+		if candidate == blocked || strings.HasPrefix(candidate, blocked+string(filepath.Separator)) {
+			return Block, "credential or system path: " + blocked
+		}
+	}
 	if !inScope(relPath, c.AllowedPaths) {
 		return Flag, "write outside contract scope"
 	}

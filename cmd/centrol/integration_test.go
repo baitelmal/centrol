@@ -1152,6 +1152,57 @@ func TestProxyTargetURLFromConfigIsUsedWhenNoFlagsGiven(t *testing.T) {
 	}
 }
 
+// ===========================================================================
+// v0.2.0 audit: proxy.additional_block_paths must be enforced under
+// `centrol guard`, not just `centrol proxy`.
+// ===========================================================================
+
+// TestGuardEnforcesAdditionalBlockPaths is a regression test for a real
+// bug found during the hygiene audit: cmd_proxy.go resolved
+// proxy.additional_block_paths into its contract's ProtectedPaths, but
+// cmd_guard.go never did, so a path an operator explicitly configured
+// as an additional protected path was silently unenforced — no
+// policy.violation at all — under `centrol guard`, even though both
+// surfaces share the same Contract/EvaluateFSPath machinery and the
+// project's own standard calls for symmetry between sibling
+// implementations.
+func TestGuardEnforcesAdditionalBlockPaths(t *testing.T) {
+	dir := initTestRepo(t)
+	if err := os.MkdirAll(filepath.Join(dir, ".centrol"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secretDir := filepath.Join(dir, "secrets")
+	if err := os.MkdirAll(secretDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configContent := fmt.Sprintf("[proxy]\nadditional_block_paths = [%q]\n", secretDir)
+	if err := os.WriteFile(filepath.Join(dir, ".centrol", "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	script := fmt.Sprintf("echo s > %s\n", filepath.Join(secretDir, "s.txt"))
+	_, stderr, code := centrol(t, dir, "guard", "--", "sh", "-c", script)
+	if code != 0 {
+		t.Fatalf("guard failed: %s", stderr)
+	}
+
+	auditOut, _, auditCode := centrol(t, dir, "audit")
+	if auditCode != 0 {
+		t.Fatalf("audit failed: %s", auditOut)
+	}
+	ledgerData, err := os.ReadFile(filepath.Join(dir, ".centrol", "lighthouse.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledgerText := string(ledgerData)
+	if !strings.Contains(ledgerText, `"type":"policy.violation"`) || !strings.Contains(ledgerText, `"path":"secrets/s.txt"`) {
+		t.Fatalf("expected a policy.violation for a write under the configured additional_block_paths entry, got ledger:\n%s", ledgerText)
+	}
+	if !strings.Contains(ledgerText, `"tier":"block"`) {
+		t.Fatalf("expected the violation's tier to be block (a protected path, not merely out of scope), got ledger:\n%s", ledgerText)
+	}
+}
+
 func TestProxyTargetFlagOverridesConfiguredTargetURL(t *testing.T) {
 	dir := initTestRepo(t)
 

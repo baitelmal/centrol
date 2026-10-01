@@ -135,6 +135,28 @@ func cmdGuard(args []string) {
 	}
 	gc := newGuardedContract(contract)
 
+	// Audit fix: proxy.additional_block_paths was wired into `centrol
+	// proxy`'s contract (see cmd_proxy.go) but never resolved here, so a
+	// path an operator configured as an additional protected path was
+	// silently unenforced under `centrol guard` even though both
+	// surfaces share the same Contract/EvaluateFSPath machinery. Same
+	// resolve-once-at-setup, canonicalize-once pattern as cmd_proxy.go.
+	var additionalBlockPaths []string
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		additionalBlockPaths, _, e = policy.ResolveAdditionalBlockPaths(resolver)
+		return e
+	}); err != nil {
+		end("resolve_additional_block_paths_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol guard: %v\n", err)
+		})
+		return
+	}
+	if len(additionalBlockPaths) > 0 {
+		contract.ProtectedPaths = append(contract.ProtectedPaths, policy.CanonicalizeBlockPaths(additionalBlockPaths)...)
+		gc = newGuardedContract(contract)
+	}
+
 	var observeFromConfig bool
 	if err := runSetup(ctx, end, signalOutcome, func() error {
 		var e error
