@@ -511,3 +511,199 @@ func TestWatcherDebounceFlushesPendingEntryOnClose(t *testing.T) {
 		t.Fatalf("expected late.txt's still-pending debounce entry to be flushed by Close, got %v", emitted)
 	}
 }
+
+// TestSnapshotDoesNotFollowUntrackedSymlinks is a regression test for a
+// real bug found during the v0.2.0 hygiene audit: addManifestEntry
+// correctly skipped symlinks when building manifest.json (returning a
+// nil error, indistinguishable from "added"), but the untracked-file
+// loop treated that skip as success and unconditionally copied the
+// entry anyway. copyFile's os.Open follows symlinks, so an untracked
+// symlink in the working tree pointing anywhere on disk had its
+// TARGET's content silently captured into the snapshot store on every
+// guarded run. This test places an untracked symlink pointing at a
+// file outside the repo entirely and confirms neither its target's
+// content nor any copy of it ever lands under snapshotDir/untracked.
+func TestSnapshotDoesNotFollowUntrackedSymlinks(t *testing.T) {
+	repo := initRepo(t)
+	ignore, err := LoadIgnore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outside := t.TempDir()
+	secretPath := filepath.Join(outside, "secret.txt")
+	const secretContent = "outside-repo-secret-the-snapshot-must-never-copy"
+	if err := os.WriteFile(secretPath, []byte(secretContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(repo, "untracked-link")
+	if err := os.Symlink(secretPath, link); err != nil {
+		t.Skipf("symlinks not supported on this filesystem: %v", err)
+	}
+
+	snapDir := filepath.Join(t.TempDir(), "run-1")
+	if err := Snapshot(repo, snapDir, ignore); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	// The symlink must not appear in manifest.json (pre-existing,
+	// already-correct behavior) ...
+	manifestBytes, err := os.ReadFile(filepath.Join(snapDir, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range manifest.Files {
+		if f.Path == "untracked-link" {
+			t.Fatalf("expected the symlink to be excluded from manifest.json, got an entry: %+v", f)
+		}
+	}
+
+	// ... and, the actual bug, the secret's content must not have been
+	// copied into untracked/untracked-link (or anywhere else under the
+	// snapshot) by following the symlink.
+	copiedPath := filepath.Join(snapDir, "untracked", "untracked-link")
+	if data, err := os.ReadFile(copiedPath); err == nil {
+		t.Fatalf("snapshot followed the untracked symlink and copied its target's content: %q", data)
+	}
+
+	matches, err := filepath.Glob(filepath.Join(snapDir, "**", "*"))
+	if err == nil {
+		for _, m := range matches {
+			if data, rerr := os.ReadFile(m); rerr == nil && strings.Contains(string(data), secretContent) {
+				t.Fatalf("found the outside-repo secret's content copied into the snapshot at %s", m)
+			}
+		}
+	}
+}
+
+// TestSnapshotWritesPrivateFilePermissions is the audit's 5a finding:
+// a snapshot captures the full working-tree diff and untracked file
+// contents (frequently including secrets mid-edit), so everything
+// under snapshotDir must be private to the owner, not world-readable.
+func TestSnapshotWritesPrivateFilePermissions(t *testing.T) {
+	repo := initRepo(t)
+	ignore, err := LoadIgnore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "untracked.txt"), []byte("secret-ish"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapDir := filepath.Join(t.TempDir(), "run-1")
+	if err := Snapshot(repo, snapDir, ignore); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	checkMode := func(path string, wantFile os.FileMode) {
+		t.Helper()
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if info.IsDir() {
+			if perm := info.Mode().Perm(); perm != 0o700 {
+				t.Fatalf("expected %s to be mode 0700, got %o", path, perm)
+			}
+			return
+		}
+		if perm := info.Mode().Perm(); perm != wantFile {
+			t.Fatalf("expected %s to be mode %o, got %o", path, wantFile, perm)
+		}
+	}
+	checkMode(snapDir, 0)
+	checkMode(filepath.Join(snapDir, "head.txt"), 0o600)
+	checkMode(filepath.Join(snapDir, "stash.diff"), 0o600)
+	checkMode(filepath.Join(snapDir, "manifest.json"), 0o600)
+	checkMode(filepath.Join(snapDir, "untracked"), 0)
+	checkMode(filepath.Join(snapDir, "untracked", "untracked.txt"), 0o600)
+}
+
+// TestScanExistingBlocksSymlinkEscape is a regression test for the
+// other half of the same audit finding: handle() enforces the
+// mandatory symlink-escape check (resolveNoEscape) before every
+// emission, but scanExisting — which backfills files that raced into a
+// just-created directory before its watch was registered — did not,
+// so a symlink placed inside such a directory during that race window
+// was emitted as a plain fs.create instead of being refused like
+// handle() would have refused it. This drives scanExisting directly
+// (rather than racing a real mkdir+symlink against fsnotify, which
+// would be inherently timing-dependent) against a directory that
+// already contains an escaping symlink.
+func TestScanExistingBlocksSymlinkEscape(t *testing.T) {
+	repo := initRepo(t)
+	outside := t.TempDir()
+	target := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(target, []byte("outside-repo-secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	newDir := filepath.Join(repo, "raced-dir")
+	if err := os.Mkdir(newDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(newDir, "escape-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks not supported on this filesystem: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(newDir, "plain.txt"), []byte("ordinary file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var violations []map[string]interface{}
+	var creates []string
+	emit := func(run, src, typ string, payload map[string]interface{}) error {
+		mu.Lock()
+		defer mu.Unlock()
+		switch typ {
+		case "policy.violation":
+			violations = append(violations, payload)
+		case "fs.create":
+			creates = append(creates, payload["path"].(string))
+		}
+		return nil
+	}
+
+	ignore, err := LoadIgnore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(repo, "run-1", ignore, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	w.scanExisting(newDir)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, c := range creates {
+		if strings.Contains(c, "escape-link") {
+			t.Fatalf("expected the escaping symlink never to be emitted as a plain fs.create, got creates=%v", creates)
+		}
+	}
+	foundViolation := false
+	for _, v := range violations {
+		if p, _ := v["path"].(string); strings.Contains(p, "escape-link") {
+			foundViolation = true
+		}
+	}
+	if !foundViolation {
+		t.Fatalf("expected a policy.violation for the escaping symlink found by scanExisting, got violations=%v", violations)
+	}
+	foundPlain := false
+	for _, c := range creates {
+		if strings.Contains(c, "plain.txt") {
+			foundPlain = true
+		}
+	}
+	if !foundPlain {
+		t.Fatalf("expected the ordinary file in the same race-window directory to still be emitted as fs.create, got creates=%v", creates)
+	}
+}

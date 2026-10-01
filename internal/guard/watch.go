@@ -267,6 +267,26 @@ func (w *Watcher) scanExisting(root string) {
 		if d.IsDir() {
 			return nil // the directory's own Create event is handled by the caller; only pre-existing files inside it are this function's job
 		}
+
+		// Audit fix: handle() treats symlink-escape resolution as
+		// mandatory before every emission (see its own doc comment); this
+		// backfill reaches the ledger the same way handle() does, so a
+		// symlink that raced into the directory before its watch was
+		// registered must be refused identically, not emitted as a plain
+		// fs.create.
+		real, inside, resolveErr := resolveNoEscape(w.repoRoot, path)
+		if resolveErr != nil {
+			return nil
+		}
+		if !inside {
+			_ = w.emit(w.runID, "guard", "policy.violation", map[string]interface{}{
+				"reason": "symlink escape: path resolves outside repo root",
+				"path":   relSlash,
+				"target": real,
+			})
+			return nil
+		}
+
 		_ = w.emit(w.runID, "guard", "fs.create", map[string]interface{}{"path": relSlash})
 		return nil
 	})

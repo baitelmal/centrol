@@ -79,7 +79,12 @@ func runGitRaw(repoRoot string, args ...string) (string, error) {
 // ref list, per the mandatory instruction to avoid relying on stash
 // refs).
 func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
-	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+	// 0700/0600 throughout this function: a snapshot captures the full
+	// working-tree diff and every untracked file's content (see the
+	// untracked-file loop below), which routinely includes secrets an
+	// agent was mid-edit on — none of .centrol/snapshots/ may be
+	// world-readable.
+	if err := os.MkdirAll(snapshotDir, 0o700); err != nil {
 		return err
 	}
 
@@ -87,7 +92,7 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
 	if err != nil {
 		return fmt.Errorf("snapshot: resolving HEAD: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(snapshotDir, "head.txt"), []byte(head+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(snapshotDir, "head.txt"), []byte(head+"\n"), 0o600); err != nil {
 		return err
 	}
 
@@ -105,7 +110,7 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
 			return fmt.Errorf("snapshot: diffing stash: %w", err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(snapshotDir, "stash.diff"), []byte(diff), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(snapshotDir, "stash.diff"), []byte(diff), 0o600); err != nil {
 		return err
 	}
 
@@ -119,38 +124,51 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
 	}
 
 	untrackedDir := filepath.Join(snapshotDir, "untracked")
-	if err := os.MkdirAll(untrackedDir, 0o755); err != nil {
+	if err := os.MkdirAll(untrackedDir, 0o700); err != nil {
 		return err
 	}
 
 	manifest := Manifest{RunID: filepath.Base(snapshotDir)}
 
-	addManifestEntry := func(relPath string, tracked bool) error {
+	// addManifestEntry reports whether it actually recorded relPath
+	// (added), distinct from an error. Audit fix: the caller below used
+	// to treat addManifestEntry's "skip" return (nil error) as
+	// indistinguishable from "added," then unconditionally copyFile'd
+	// the untracked entry regardless. copyFile's os.Open follows
+	// symlinks, so an untracked symlink committed into the race window
+	// (e.g. one pointing at ~/.ssh/id_rsa) had its TARGET's content
+	// silently captured into the snapshot store on every guarded run —
+	// exactly the kind of disclosure the symlink check here was already
+	// trying to prevent for the manifest entry itself, just not for the
+	// copy. The added bool lets the untracked loop skip the copy for
+	// anything this function skipped, for the same reasons (symlink,
+	// directory, or vanished between listing and stat).
+	addManifestEntry := func(relPath string, tracked bool) (added bool, err error) {
 		full := filepath.Join(repoRoot, relPath)
 		info, err := os.Lstat(full)
 		if err != nil {
-			return nil // file vanished between listing and stat; skip
+			return false, nil // file vanished between listing and stat; skip
 		}
 		if info.Mode()&os.ModeSymlink != 0 || info.IsDir() {
-			return nil
+			return false, nil
 		}
 		sum, err := sha256File(full)
 		if err != nil {
-			return err
+			return false, err
 		}
 		manifest.Files = append(manifest.Files, ManifestEntry{
 			Path: filepath.ToSlash(relPath), Size: info.Size(),
 			ModTime: info.ModTime().Format("2006-01-02T15:04:05.000Z07:00"),
 			SHA256:  sum, Tracked: tracked,
 		})
-		return nil
+		return true, nil
 	}
 
 	for _, line := range splitNonEmpty(trackedOut) {
 		if isCentrolOrGitPath(line) || ignore.Match(line) {
 			continue
 		}
-		if err := addManifestEntry(line, true); err != nil {
+		if _, err := addManifestEntry(line, true); err != nil {
 			return err
 		}
 	}
@@ -158,13 +176,20 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
 		if isCentrolOrGitPath(line) || ignore.Match(line) {
 			continue
 		}
-		if err := addManifestEntry(line, false); err != nil {
+		added, err := addManifestEntry(line, false)
+		if err != nil {
 			return err
+		}
+		if !added {
+			continue // symlink, directory, or vanished — never copy; see addManifestEntry's doc comment
 		}
 		src := filepath.Join(repoRoot, line)
 		dst := filepath.Join(untrackedDir, line)
 		if err := copyFile(src, dst); err != nil {
 			return fmt.Errorf("snapshot: copying untracked %s: %w", line, err)
+		}
+		if err := os.Chmod(dst, 0o600); err != nil {
+			return fmt.Errorf("snapshot: restricting permissions on untracked %s: %w", line, err)
 		}
 	}
 
@@ -172,7 +197,7 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(snapshotDir, "manifest.json"), manifestBytes, 0o644)
+	return os.WriteFile(filepath.Join(snapshotDir, "manifest.json"), manifestBytes, 0o600)
 }
 
 // RestoreOutcome reports what a Restore could and couldn't do, per the
