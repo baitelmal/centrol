@@ -847,6 +847,66 @@ func TestConfigMenuSyntheticLockedValueDisplaysAndCannotBeEdited(t *testing.T) {
 	}
 }
 
+// TestValidTargetURLScheme is a direct unit check of the audit's 3a
+// fix: only http/https schemes (or empty, to unset) are acceptable.
+func TestValidTargetURLScheme(t *testing.T) {
+	cases := map[string]bool{
+		"":                            true,
+		"https://mcp.example.com/sse": true,
+		"http://127.0.0.1:8080/mcp":   true,
+		"file:///etc/passwd":          false,
+		"ftp://example.com/x":         false,
+		"javascript:alert(1)":         false,
+		"example.com":                 false, // no scheme at all
+		"://not-a-url":                false,
+	}
+	for v, want := range cases {
+		if got := validTargetURLScheme(v); got != want {
+			t.Errorf("validTargetURLScheme(%q) = %v, want %v", v, got, want)
+		}
+	}
+}
+
+// TestConfigMenuRejectsInvalidTargetURLScheme drives the proxy submenu's
+// "Edit target_url" option end to end: an invalid scheme must be
+// refused with no write, and a subsequent valid https URL must be
+// accepted and persisted.
+func TestConfigMenuRejectsInvalidTargetURLScheme(t *testing.T) {
+	dir := t.TempDir()
+	resolver := policy.NewResolver(
+		policy.NewSessionContractSource(),
+		policy.NewEnterpriseSource(),
+		policy.NewLocalFileSource(policy.SourceRepoConfig, filepath.Join(dir, "repo-config.toml")),
+		policy.NewLocalFileSource(policy.SourceUserConfig, filepath.Join(dir, "user-config.toml")),
+		policy.NewDefaultSource(nil),
+	)
+
+	// Proxy section (3), edit target_url (4), an invalid scheme, then a
+	// valid https URL, then back out and quit.
+	in := bufio.NewReader(strings.NewReader("3\n4\nfile:///etc/passwd\n4\nhttps://mcp.example.com/sse\nb\nq\n"))
+	var out bytes.Buffer
+	runConfigMenu(in, &out, resolver)
+
+	got := out.String()
+	if !strings.Contains(got, "must be an http:// or https:// URL") {
+		t.Fatalf("expected the invalid scheme to be rejected with a clear message, got:\n%s", got)
+	}
+	if !strings.Contains(got, `Set target_url = "https://mcp.example.com/sse"`) {
+		t.Fatalf("expected the valid https URL to be accepted, got:\n%s", got)
+	}
+
+	repoData, err := os.ReadFile(filepath.Join(dir, "repo-config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(repoData), "etc/passwd") {
+		t.Fatalf("expected the rejected file:// URL never to be written, got:\n%s", repoData)
+	}
+	if !strings.Contains(string(repoData), "https://mcp.example.com/sse") {
+		t.Fatalf("expected the valid https URL to be persisted, got:\n%s", repoData)
+	}
+}
+
 // ===========================================================================
 // Ship criterion 9: the run summary prints on every trappable exit path
 // (normal, panic, SIGINT, SIGTERM), is never suppressed by --quiet, and

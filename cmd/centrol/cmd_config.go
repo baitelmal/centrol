@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -221,6 +222,25 @@ func configGateMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver) 
 	}
 }
 
+// validTargetURLScheme reports whether v is acceptable as
+// proxy.target_url: either empty (unsetting the value — HTTP mode
+// turned off) or a URL whose scheme is exactly "http" or "https", the
+// only two schemes internal/proxy/transport.HTTPTarget ever uses.
+// Audit fix (3a): this used to be written to config.toml unvalidated,
+// so a typo'd scheme, a bare host with none at all, or something like
+// file:// or javascript: would be silently accepted here and only
+// fail (or not) much later, inside the HTTP transport.
+func validTargetURLScheme(v string) bool {
+	if v == "" {
+		return true
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
+}
+
 func configProxyMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver) {
 	for {
 		blockPaths, blockPathsSrc, err := policy.ResolveAdditionalBlockPaths(resolver)
@@ -330,6 +350,10 @@ func configProxyMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver)
 			}
 			fmt.Fprint(out, "New value (HTTP target URL, empty to unset): ")
 			v := readMenuLine(in)
+			if !validTargetURLScheme(v) {
+				fmt.Fprintf(out, "error: target_url must be an http:// or https:// URL (or empty to unset), got %q\n", v)
+				continue
+			}
 			src, err := resolver.WriteConfig(policy.KeyProxyTargetURL, v)
 			if err != nil {
 				fmt.Fprintf(out, "error: %v\n", err)
