@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -846,5 +847,46 @@ func TestHTTPTargetDoesNotRetryAfterAResponseWasReceived(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("expected exactly 1 request — a received response must never be retried — got %d", calls)
+	}
+}
+
+// TestHTTPTargetRejectsOversizedJSONResponseBody is a regression test
+// for a v0.2.0 audit finding: sendOnce's application/json branch used
+// a bare io.ReadAll(resp.Body) with no size bound at all, unlike its
+// sibling error-status branches (each already wrapped in
+// io.LimitReader) and deliverSSE's own per-line cap — a malicious or
+// compromised target returning an arbitrarily large 2xx body could OOM
+// the process. This serves a body one byte over maxJSONResponseBytes
+// and confirms Send returns an error (never forwarding any of it)
+// rather than reading the whole thing into memory.
+func TestHTTPTargetRejectsOversizedJSONResponseBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		written := int64(0)
+		chunk := bytes.Repeat([]byte("a"), 1<<20)
+		for written <= maxJSONResponseBytes {
+			n, err := w.Write(chunk)
+			if err != nil {
+				return
+			}
+			written += int64(n)
+		}
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	err := target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`))
+	if err == nil {
+		t.Fatal("expected Send to reject a response body larger than maxJSONResponseBytes")
+	}
+
+	select {
+	case frame := <-ch:
+		t.Fatalf("expected no frame delivered for an oversized body, got %d bytes", len(frame))
+	case <-time.After(100 * time.Millisecond):
 	}
 }

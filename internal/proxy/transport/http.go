@@ -15,6 +15,23 @@ import (
 	"time"
 )
 
+// maxJSONResponseBytes bounds how much of a single application/json
+// response body sendOnce will read into memory. Audit fix: this path
+// previously used a bare io.ReadAll(resp.Body) with no limit at all,
+// unlike the two error-status branches a few lines above it (each
+// already wrapped in io.LimitReader) and deliverSSE's own per-line
+// buffer cap just below — a malicious or compromised target returning
+// an arbitrarily large 2xx body could OOM the proxy process. Sized the
+// same as deliverSSE's per-event buffer cap for consistency; there is
+// no spec reason a legitimate single JSON-RPC frame needs to approach
+// this size.
+const maxJSONResponseBytes = 16 * 1024 * 1024
+
+// deleteTimeout bounds the best-effort session-teardown DELETE Stop
+// sends — see Stop's doc comment for why this is a fixed bound
+// independent of the operator-configured Timeout field.
+const deleteTimeout = 5 * time.Second
+
 // ErrHTTPTimeout marks an HTTPTarget.Send failure as the configured
 // per-request timeout expiring (Timeout, or the context passed to
 // Start running out), distinct from other transport errors, so a
@@ -351,9 +368,12 @@ func (t *HTTPTarget) sendOnce(frame []byte) error {
 		// frame. If it isn't valid JSON-RPC, HandleTargetResponse
 		// already flags that as policy.silence — the same as any other
 		// malformed frame, stdio included.
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONResponseBytes+1))
 		if err != nil {
 			return fmt.Errorf("proxy: reading target's response: %w", err)
+		}
+		if len(body) > maxJSONResponseBytes {
+			return fmt.Errorf("proxy: target's response body exceeded %d bytes", maxJSONResponseBytes)
 		}
 		t.deliver(body)
 		return nil
@@ -467,7 +487,19 @@ func (t *HTTPTarget) Stop() error {
 	t.mu.Unlock()
 
 	if sid != "" {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, t.URL, nil)
+		// Audit fix: this request used to carry context.Background() —
+		// no deadline at all, unlike every other request sendOnce makes
+		// (requestContext applies t.Timeout). A target that accepts the
+		// connection but never responds to the DELETE could hang this
+		// call, and therefore Stop, and therefore the whole proxy
+		// process's shutdown path, indefinitely. deleteTimeout is a
+		// fixed bound independent of t.Timeout (which may be 0 — no
+		// limit — by the operator's own choice for normal traffic) since
+		// this is best-effort cleanup, not a call whose latency the
+		// operator has any reason to tune.
+		ctx, cancel := context.WithTimeout(context.Background(), deleteTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.URL, nil)
 		if err == nil {
 			req.Header.Set("Mcp-Session-Id", sid)
 			if resp, derr := t.httpClient().Do(req); derr == nil {
