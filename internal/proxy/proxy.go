@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/scirem/centrol/internal/gate"
 	"github.com/scirem/centrol/internal/policy"
 )
 
@@ -558,13 +559,18 @@ func policyDenialResponse(id json.RawMessage, reason, target, suggestion string)
 	return json.Marshal(resp)
 }
 
-// timeoutErrorResponse builds the structured JSON-RPC error for
+// TimeoutErrorResponse builds the structured JSON-RPC error for
 // proxy.mcp_call_timeout_seconds: a distinct code (-32000) and message
 // from an ordinary policy denial, since a timeout is an operational
 // failure, not a decision anyone made about the call's legitimacy — but
 // the same structured data.reason="mcp_call_timeout" shape, so agent
 // code that already branches on data.reason handles both uniformly.
-func timeoutErrorResponse(id json.RawMessage, tool string) ([]byte, error) {
+//
+// Exported (Pass 3.9c): Governor.Run, which replaces this package's own
+// former RunTarget as the pump orchestrator, lives in internal/governor
+// and needs this to build its OnTimeout callback; it was package-private
+// until the orchestration loop moved out of internal/proxy.
+func TimeoutErrorResponse(id json.RawMessage, tool string) ([]byte, error) {
 	resp := structuredRPCError{JSONRPC: "2.0", ID: id}
 	resp.Error.Code = -32000
 	resp.Error.Message = "mcp call timeout"
@@ -666,6 +672,55 @@ func walkArgValues(v interface{}, out *policy.ToolCallArgs) {
 	case []interface{}:
 		for _, vv := range val {
 			walkArgValues(vv, out)
+		}
+	}
+}
+
+// StderrPrompt is a PromptFunc that renders the FLAG UI ([Allow once |
+// Allow session | Deny]) on the controlling TTY when available, falling
+// back to stderr-only (non-interactive: always Deny) otherwise. It never
+// touches stdout. timeout bounds how long it waits for a human response
+// before returning Timeout (fail closed) — see gate.PromptWithTimeout.
+//
+// Relocated here from run.go (Pass 3.9c, Shape A): it is a PromptFunc
+// constructor tightly coupled to Interceptor.Prompt and the gate
+// package, not run-orchestration logic, so it stays in internal/proxy
+// rather than moving to internal/governor with RunTarget.
+func StderrPrompt(diagOut io.Writer, timeout time.Duration) PromptFunc {
+	return func(toolName, reason, argsPreview string, allowSessionOffered bool) (Decision, error) {
+		tty, err := gate.OpenControllingTTY()
+		if err != nil {
+			fmt.Fprintf(diagOut, "centrol: FLAGGED %s (%s) — no interactive terminal available, denying\n", toolName, reason)
+			return Deny, nil
+		}
+		defer tty.Close()
+
+		options := []gate.Option{gate.Opt("Allow once")}
+		if allowSessionOffered {
+			options = append(options, gate.Opt("Allow session"))
+		}
+		options = append(options, gate.Opt("Deny"))
+
+		title := "centrol: FLAGGED tool call"
+		detail := fmt.Sprintf("tool:   %s\n  reason: %s\n  args:   %s", toolName, reason, argsPreview)
+
+		decision, err := gate.PromptWithTimeout(tty, tty, title, detail, options, timeout)
+		if err == gate.ErrPromptTimeout {
+			return Timeout, nil
+		}
+		if err != nil {
+			return Deny, err
+		}
+		if decision < 0 || int(decision) >= len(options) {
+			return Deny, nil // gate.NoDecision or anything unmatched fails closed
+		}
+		switch options[decision].Display {
+		case "Allow once":
+			return AllowOnce, nil
+		case "Allow session":
+			return AllowSession, nil
+		default:
+			return Deny, nil
 		}
 	}
 }

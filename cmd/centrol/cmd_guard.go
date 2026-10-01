@@ -66,33 +66,67 @@ func cmdGuard(args []string) {
 			fmt.Fprintf(os.Stderr, "centrol guard: warning: could not clear run marker: %v\n", err)
 		}
 	}
-	stopEarlySignal := earlySignalHandler(func(code int) {
-		printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-		clearMarker()
-		os.Exit(code)
-	})
+	// end is the one run-scoped "end the run" decision point every exit
+	// site below calls through, from here (runID acquisition) onward
+	// (Pass 3.9c Final) — see its doc comment in summary.go for the
+	// win/lose contract. It is also the only thing that ever calls
+	// Governor.Exit for this run.
+	end := endRun(g, runID, ledgerPath(root), started, counters, clearMarker)
+	// ctx/signalOutcome cover the window up to terminal.Run taking over
+	// (Pass 3.9c Final correction): every blocking setup step below runs
+	// through runSetup, which blocks THIS goroutine (main's own) on a
+	// select against ctx, rather than ever letting the signal watch
+	// itself call end/Exit from its own goroutine — see newSignalWatch's
+	// and runSetup's doc comments in summary.go for why that distinction
+	// matters. Once the wrapped agent is actually running, a real
+	// SIGINT/SIGTERM/SIGHUP reaches centrol and the agent's process
+	// group simultaneously, and terminal.Run's own forwarding already
+	// produces the right summary + exit code via the ordinary
+	// end-of-function path below — so this watch steps aside there
+	// instead of racing it.
+	ctx, signalOutcome, stopSignalWatch := newSignalWatch(g)
 	defer func() {
 		if r := recover(); r != nil {
-			printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-			clearMarker()
-			fmt.Fprintf(os.Stderr, "centrol guard: panic: %v\n", r)
-			os.Exit(ui.ExitRuntimeError)
+			end("panic", ui.ExitRuntimeError, func() {
+				fmt.Fprintf(os.Stderr, "centrol guard: panic: %v\n", r)
+			})
 		}
 	}()
 
-	ignore, err := guard.LoadIgnore(root)
-	if err != nil {
-		printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-		clearMarker()
-		fatalf("centrol guard: loading .centrolignore: %v", err)
+	var ignore *guard.IgnoreSet
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		ignore, e = guard.LoadIgnore(root)
+		return e
+	}); err != nil {
+		end("load_ignore_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol guard: loading .centrolignore: %v\n", err)
+		})
+		return
 	}
 
 	snapDir := filepath.Join(snapshotsDir(root), runID)
 	logger.Infof("centrol: snapshotting repo before run %s...\n", runID)
-	if err := guard.Snapshot(root, snapDir, ignore); err != nil {
-		printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-		clearMarker()
-		fatalf("centrol guard: snapshot failed, refusing to run ungoverned: %v", err)
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		return guard.Snapshot(root, snapDir, ignore)
+	}); err != nil {
+		// Race (b) (Pass 3.9 Section 5): a SIGTERM/SIGINT that lands here
+		// can kill git's own subprocess directly (it shares centrol's
+		// process group), and runSetup's own ctx-cancellation branch
+		// above usually wins this race first — but if git's subprocess
+		// happens to die and report back before that branch fires,
+		// signalCauseFromErr still recognizes it and normalizes to the
+		// same cause/code newSignalWatch would have reported, so
+		// whichever of the two actually calls end() first, the run's
+		// recorded outcome agrees.
+		if cause, code, ok := signalCauseFromErr(err); ok {
+			end(cause, code, nil)
+			return
+		}
+		end("snapshot_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol guard: snapshot failed, refusing to run ungoverned: %v\n", err)
+		})
+		return
 	}
 
 	contract := policy.DefaultContract(policy.KindGuard, runID, root)
@@ -101,11 +135,16 @@ func cmdGuard(args []string) {
 	}
 	gc := newGuardedContract(contract)
 
-	observeFromConfig, _, cerr := policy.ResolveObserveMode(resolver)
-	if cerr != nil {
-		printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-		clearMarker()
-		fatalf("centrol guard: %v", cerr)
+	var observeFromConfig bool
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		observeFromConfig, _, e = policy.ResolveObserveMode(resolver)
+		return e
+	}); err != nil {
+		end("resolve_observe_mode_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol guard: %v\n", err)
+		})
+		return
 	}
 	observe := observeFlag || observeFromConfig
 	if observe {
@@ -119,25 +158,36 @@ func cmdGuard(args []string) {
 		fmt.Fprintf(os.Stderr, "centrol guard: warning: could not write run marker: %v\n", err)
 	}
 	// clearMarker itself is defined earlier (before snapshotting) so the
-	// early-signal/panic handlers above can call it too. It's still not
-	// a defer for the reason noted there: every exit path below calls
-	// os.Exit (directly, or via fatalf), which skips deferred functions.
+	// signal watch/panic handlers above can call it too. It's still not
+	// a defer for the reason noted there: every exit path below ends in
+	// Governor.Exit (via end()), which calls os.Exit and so skips
+	// deferred functions.
 
 	_ = emit(runID, "guard", "run.start", map[string]interface{}{
 		"agent": agentArgs[0], "args": agentArgs[1:], "snapshot": snapDir,
 	})
 
-	debounceMS, _, err := policy.ResolveWatcherDebounceMS(resolver)
-	if err != nil {
-		printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-		clearMarker()
-		fatalf("centrol guard: %v", err)
+	var debounceMS int
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		debounceMS, _, e = policy.ResolveWatcherDebounceMS(resolver)
+		return e
+	}); err != nil {
+		end("resolve_watcher_debounce_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol guard: %v\n", err)
+		})
+		return
 	}
-	watcher, err := guard.NewWatcherWithDebounce(root, runID, ignore, contractAwareEmit(emit, gc, observe), time.Duration(debounceMS)*time.Millisecond)
-	if err != nil {
-		printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-		clearMarker()
-		fatalf("centrol guard: starting watcher: %v", err)
+	var watcher *guard.Watcher
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		watcher, e = guard.NewWatcherWithDebounce(root, runID, ignore, contractAwareEmit(emit, gc, observe), time.Duration(debounceMS)*time.Millisecond)
+		return e
+	}); err != nil {
+		end("start_watcher_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol guard: starting watcher: %v\n", err)
+		})
+		return
 	}
 	watcherDone := make(chan struct{})
 	go func() { watcher.Run(); close(watcherDone) }()
@@ -150,9 +200,31 @@ func cmdGuard(args []string) {
 	// terminal.Run installs its own signal.Notify and forwards to the
 	// child, then returns the signal-derived exit code once the child
 	// dies (128+sig) rather than centrol itself being killed. So signal
-	// responsibility hands off to terminal.Run here, and the early
-	// handler (for the narrower window before this point) steps aside.
-	stopEarlySignal()
+	// responsibility hands off to terminal.Run here, and the Governor's
+	// own signal watch (for the narrower window before this point) steps
+	// aside.
+	stopSignalWatch()
+	// checkCancelled AFTER stopSignalWatch, not before: stopSignalWatch
+	// (newSignalWatch's own stop, cmd/centrol/summary.go — which settles
+	// the underlying WatchSignals watch but deliberately never
+	// unregisters it; see that doc comment) blocks until the watch's
+	// goroutine has made its final, settled decision about any signal
+	// it may have received, so this check sees the complete truth for
+	// the entire pre-Run window — including a signal landing in the
+	// plain synchronous stretch since the last runSetup call above
+	// (watcher/pollScopeAmendments startup, nothing ctx.Done() could
+	// otherwise interrupt), AND a signal arriving in the exact instant
+	// of this handoff itself. Checking before stopSignalWatch returned
+	// used to miss that second case: a signal this watch itself had
+	// already consumed, but not yet finished processing, could still
+	// call onReceived/cancel() strictly after this check had already
+	// run and after cmd_guard had already moved on into terminal.Run —
+	// a real SIGINT, swallowed by this watch, with no reader left for
+	// the cancellation it eventually produced. See
+	// Governor.WatchSignals' doc comment in internal/governor/run.go
+	// for the fix (and for why this watch's registration is left
+	// active rather than unregistered here).
+	checkCancelled(end, signalOutcome)
 
 	exitCode, runErr := terminal.Run(agentArgs[0], agentArgs[1:], nil)
 
@@ -175,21 +247,22 @@ func cmdGuard(args []string) {
 		endPayload["error"] = runErr.Error()
 	}
 	_ = emit(runID, "guard", "run.end", endPayload)
-	clearMarker()
 
-	// The run summary prints on every trappable exit from here: normal
-	// completion, and the runErr path below (terminal.Run itself failed
-	// to start/manage the child — distinct from the agent's own exit
-	// code, which is exitCode and already reported above). Never gated
-	// by --quiet: printRunSummary writes straight to os.Stderr, not
-	// through logger.
-	printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-
+	// end prints the run summary and clears the marker on every
+	// trappable exit from here: normal completion, and the runErr branch
+	// below (terminal.Run itself failed to start/manage the child —
+	// distinct from the agent's own exit code, which is exitCode and
+	// already reported above). Never gated by --quiet: printRunSummary
+	// writes straight to os.Stderr, not through logger.
 	if runErr != nil {
-		fatalf("centrol guard: running agent: %v", runErr)
+		end("agent_run_error", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol guard: running agent: %v\n", runErr)
+		})
+		return
 	}
-	fmt.Fprintf(os.Stderr, "centrol: run %s finished (exit %d). Roll back with: centrol undo\n", runID, exitCode)
-	os.Exit(exitCode)
+	end("agent_exit", exitCode, func() {
+		fmt.Fprintf(os.Stderr, "centrol: run %s finished (exit %d). Roll back with: centrol undo\n", runID, exitCode)
+	})
 }
 
 // splitAfterDoubleDash returns everything after a literal "--" in args.

@@ -91,10 +91,18 @@ type HTTPTarget struct {
 	// have processed the request.
 	MaxRetries int
 
-	mu      sync.Mutex
-	ctx     context.Context
-	recvCh  chan []byte
-	stopped bool
+	mu       sync.Mutex
+	ctx      context.Context
+	recvOnce sync.Once
+	recvCh   chan []byte
+	stopped  bool
+
+	// sendWG tracks deliver calls that have passed the stopped check and
+	// are about to (or are currently) send on recvCh, so Stop can wait
+	// for them to finish before it closes the channel — see deliver's
+	// and Stop's doc comments for why this replaced holding t.mu across
+	// the send itself.
+	sendWG sync.WaitGroup
 }
 
 // Start records ctx for subsequent requests. Streamable HTTP has no
@@ -113,26 +121,40 @@ func (t *HTTPTarget) Start(ctx context.Context) error {
 
 // Receive returns the channel Send delivers response frames onto.
 // Safe to call more than once, including after Stop: recvCh is
-// allocated once (in Start, or lazily here if Receive is somehow
-// called first) and is never replaced or nilled out, so a Receive
-// call that races with or follows Stop still gets the same channel
-// Stop closed — a `for range` over it exits immediately instead of
-// blocking on a fresh, orphaned channel nothing will ever close.
+// allocated exactly once (via recvOnce, in Start, or lazily here if
+// Receive is somehow called first) and is never replaced or nilled
+// out, so a Receive call that races with or follows Stop still gets
+// the same channel Stop closed — a `for range` over it exits
+// immediately instead of blocking on a fresh, orphaned channel
+// nothing will ever close.
+//
+// Deliberately takes no lock: ensureRecvCh's own sync.Once makes the
+// allocation itself safe to race, and Receive must never be blocked
+// behind t.mu — see deliver's doc comment for the deadlock that
+// caused when Receive needed the same mutex deliver held across its
+// (blocking) channel send: the target->client pump calls Receive to
+// get the channel it is about to range over, so if that call is
+// blocked waiting for a lock deliver won't release until something
+// reads from the very channel Receive hasn't returned yet, neither
+// side can ever proceed. Reproduced directly under heavy scheduler
+// contention once Governor.Run started registering its signal watch
+// (and so spawning an extra goroutine) before target.Start, which
+// shifted the two pump goroutines' relative scheduling enough to hit
+// it reliably.
 func (t *HTTPTarget) Receive() (<-chan []byte, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.ensureRecvCh()
 	return t.recvCh, nil
 }
 
-// ensureRecvCh lazily allocates recvCh exactly once. Callers must
-// hold t.mu. recvCh, once allocated, is never set back to nil —
-// see Stop and deliver for why that invariant is what makes this
-// type's shutdown safe.
+// ensureRecvCh lazily allocates recvCh exactly once, via sync.Once —
+// safe to call without holding t.mu, and from any number of
+// goroutines concurrently. recvCh, once allocated, is never set back
+// to nil — see Stop and deliver for why that invariant is what makes
+// this type's shutdown safe.
 func (t *HTTPTarget) ensureRecvCh() {
-	if t.recvCh == nil {
+	t.recvOnce.Do(func() {
 		t.recvCh = make(chan []byte)
-	}
+	})
 }
 
 // Send POSTs frame to URL and forwards whatever response frame(s) it
@@ -266,27 +288,44 @@ func (t *HTTPTarget) deliverSSE(body io.Reader) error {
 // matches StdioTarget/proxy.ReadFrames's own convention of never
 // handing out a slice a caller might still be reusing.
 //
-// deliver holds t.mu across the send itself, not just the channel
-// lookup, so the "is t.stopped" check and the send are atomic with
-// respect to Stop's own "set stopped, then close" critical section:
-// either deliver fully completes its send before Stop closes the
-// channel, or Stop's close is visible to deliver before it would
-// send, and deliver skips the frame instead of sending on (or
-// panicking on) a closed channel. Holding the mutex across the send
-// cannot deadlock here: nothing on the receiving end (the target
-// pump's plain `for range` in proxy.RunTarget) ever calls back into
-// HTTPTarget or needs t.mu itself.
+// An earlier version of this method held t.mu across the send itself
+// (not just the "is t.stopped" check), reasoning that nothing on the
+// receiving end ever needed t.mu, so holding it across a blocking
+// send couldn't deadlock. That reasoning was wrong: the receiving end
+// is the target->client pump's call to Receive, and an earlier
+// version of Receive DID need t.mu to hand back the very channel this
+// send blocks on — so if deliver's send ran first and grabbed the
+// lock, Receive could never get it, nothing could ever read the
+// channel, and deliver's send (holding the lock) blocked forever.
+// Reproduced directly (TestRunTargetWithHTTPTargetSendsDeleteOnlyAfter-
+// BothResponsesForwarded, under heavy scheduler contention).
+//
+// The fix: sendWG, not t.mu, now guards against racing Stop's close.
+// deliver checks "is t.stopped" and, if not, registers its intent to
+// send (sendWG.Add(1)) in the same critical section — so either this
+// runs before Stop's own "set stopped, then wait, then close" critical
+// section (and Stop's Wait blocks until this send finishes, then
+// closes safely after), or Stop's stopped=true is already visible
+// here (and this skips the frame instead of sending on, or panicking
+// on, a closed channel). Either way the actual send happens with t.mu
+// released, so it can never block anything that needs t.mu to make
+// progress — including Receive.
 func (t *HTTPTarget) deliver(frame []byte) {
 	cp := make([]byte, len(frame))
 	copy(cp, frame)
+
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.stopped {
 		// Stop has already closed recvCh (or is about to, under this
 		// same lock); nothing is listening anymore, and sending here
 		// would panic on a closed channel. Drop the frame.
+		t.mu.Unlock()
 		return
 	}
+	t.sendWG.Add(1)
+	t.mu.Unlock()
+	defer t.sendWG.Done()
+
 	t.ensureRecvCh()
 	t.recvCh <- cp
 }
@@ -304,9 +343,16 @@ func (t *HTTPTarget) deliver(frame []byte) {
 // allocate a fresh channel nothing would ever write to or close,
 // hanging any `for range` over it forever. recvCh is allocated once
 // and kept for the HTTPTarget's lifetime; stopped (checked and set
-// under the same mutex as deliver's send) is the single source of
-// truth for whether the channel has been closed, which is what makes
-// the close here race-free against deliver.
+// under t.mu, same as deliver's own check) is the single source of
+// truth for whether the channel has been closed.
+//
+// Stop waits on sendWG — populated by deliver, under the same
+// stopped-check critical section — before closing the channel: any
+// deliver call that observed stopped == false before this ran has
+// already registered its intent to send, and this blocks until each
+// of those sends has actually completed, so the close below can never
+// race a send that was already committed to happen. See deliver's
+// doc comment for why t.mu itself no longer guards the send.
 func (t *HTTPTarget) Stop() error {
 	t.mu.Lock()
 	if t.stopped {
@@ -315,8 +361,6 @@ func (t *HTTPTarget) Stop() error {
 	}
 	t.stopped = true
 	sid := t.SessionID
-	t.ensureRecvCh()
-	ch := t.recvCh
 	t.mu.Unlock()
 
 	if sid != "" {
@@ -329,7 +373,9 @@ func (t *HTTPTarget) Stop() error {
 		}
 	}
 
-	close(ch)
+	t.sendWG.Wait()
+	t.ensureRecvCh()
+	close(t.recvCh)
 	return nil
 }
 

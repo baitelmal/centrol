@@ -878,12 +878,29 @@ func centrolSignaled(t *testing.T, dir string, waitFor string, sig syscall.Signa
 		t.Fatalf("starting centrol %s: %v", strings.Join(args, " "), err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	// Bug fixed here: this loop used to fall through and send sig
+	// unconditionally once the deadline passed, whether or not waitFor
+	// had actually appeared yet. Under a full `-race -count=10` run
+	// across the whole repo (heavy global CPU contention, not just
+	// this package), the fixed deadline could expire before guard/proxy
+	// even reached the marker — and the blind send that followed landed
+	// at some arbitrary later point in the run (observed once: a
+	// SIGTERM sent that late landed only after the wrapped `sleep 5`
+	// had already run to completion on its own, so the run exited 0
+	// instead of 143, with nothing to indicate why). Fatal-ing on a
+	// genuine timeout, instead of silently mistiming the signal, is
+	// what turns that into an honest, loud failure.
+	deadline := time.Now().Add(15 * time.Second)
+	found := false
 	for time.Now().Before(deadline) {
 		if strings.Contains(errBuf.String(), waitFor) {
+			found = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	if !found {
+		t.Fatalf("centrol %s: %q never appeared on stderr within 15s:\n%s", strings.Join(args, " "), waitFor, errBuf.String())
 	}
 	if err := syscall.Kill(-cmd.Process.Pid, sig); err != nil {
 		t.Fatalf("signaling centrol's process group: %v", err)
@@ -1015,6 +1032,33 @@ func TestShipCriterion9_ProxySummaryPrintsOnNormalExit(t *testing.T) {
 	_, stderr, _ := centrol(t, dir, "proxy", "--target", "cat")
 	if !strings.Contains(stderr, "Run complete") {
 		t.Fatalf("expected proxy to print a run summary on exit, got:\n%s", stderr)
+	}
+}
+
+// TestShipCriterion9_ProxySummaryPrintsOnSigint is the proxy-side
+// counterpart to TestShipCriterion9_SummaryPrintsOnSigint, exercising
+// Governor.Run's own signal watch (Pass 3.9c Final, Section 2
+// "Signals") rather than guard's hand-off to terminal.Run. --target
+// points at a small script instead of an inline shell command: proxy's
+// own --target splitting is plain whitespace (see cmd_proxy.go), which
+// would mangle a quoted `sh -c "..."` with embedded spaces, and a
+// script file is also what lets the target announce readiness on its
+// own stderr (which centrol's stdio transport passes straight through)
+// before sleeping — centrolSignaled waits for that marker the same way
+// the guard-side tests wait for "snapshotting repo", so the signal is
+// never sent before Governor.Run has actually registered its watch.
+func TestShipCriterion9_ProxySummaryPrintsOnSigint(t *testing.T) {
+	dir := initTestRepo(t)
+	script := filepath.Join(dir, "sigint_target.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho proxy_sigint_ready 1>&2\nsleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, code := centrolSignaled(t, dir, "proxy_sigint_ready", syscall.SIGINT, "proxy", "--target", script)
+	if code != 130 {
+		t.Fatalf("expected exit 130 on SIGINT, got %d:\n%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "Run complete") {
+		t.Fatalf("expected a run summary on SIGINT, got:\n%s", stderr)
 	}
 }
 

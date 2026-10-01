@@ -39,10 +39,20 @@ type schema struct {
 // Protocol Silence guarantee.
 var ErrSilenced = fmt.Errorf("governor: signal silenced (non-conforming, recorded as policy.silence)")
 
-// Governor validates and, on success, forwards signals to the ledger.
+// Governor validates and, on success, forwards signals to the ledger
+// (the rules/schema hand — Emit/Tail/Verify/Resume below) and, as of
+// Pass 3.9, also owns run lifecycle and process termination (the
+// run/change hand — Stop, MarkStopped, Phase, Cause, ExitCode, Exit,
+// WatchSignals, Run, all in run.go). Both hands share this one struct;
+// run's own mutex (runState.mu) is always acquired independently of
+// any ledger-level locking — no code path in either hand holds one
+// lock while acquiring the other, so no lock ordering rule beyond
+// "never nest them" is needed.
 type Governor struct {
 	ledger *ledger.Ledger
 	sc     schema
+
+	run runState
 }
 
 // New loads schemas/event.v1.json (embedded at build time) and binds to

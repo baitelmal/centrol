@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -138,33 +139,45 @@ func cmdProxyRun(args []string) {
 			fmt.Fprintf(os.Stderr, "centrol proxy: warning: could not clear run marker: %v\n", err)
 		}
 	}
-	stopEarlySignal := earlySignalHandler(func(code int) {
-		printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-		clearMarker()
-		os.Exit(code)
-	})
+	// end is the one run-scoped "end the run" decision point every exit
+	// site below calls through, from here (runID acquisition) onward
+	// (Pass 3.9c Final) — see its doc comment in summary.go for the
+	// win/lose contract. It is also the only thing that ever calls
+	// Governor.Exit for this run.
+	end := endRun(g, runID, ledgerPath(root), started, counters, clearMarker)
+	// ctx/signalOutcome cover this function's own pre-Run setup window
+	// (Pass 3.9c Final correction): every blocking setup step below —
+	// including the allowlist prompt, which can block on stdin — runs
+	// through runSetup, which blocks THIS goroutine (main's own) on a
+	// select against ctx, rather than ever letting the signal watch
+	// itself call end/Exit from its own goroutine. See newSignalWatch's
+	// and runSetup's doc comments in summary.go for why that distinction
+	// matters. Once g.Run is called below, Run registers its own signal
+	// watch for its full duration (Pass 3.9c Final, Section 2 "Signals")
+	// — unlike centrol guard, Governor.Run manages the target directly
+	// with no separate forwarding mechanism to hand off to, so this
+	// watch steps aside right before that call instead of racing it.
+	ctx, signalOutcome, stopSignalWatch := newSignalWatch(g)
 	defer func() {
 		if r := recover(); r != nil {
-			printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-			clearMarker()
-			fmt.Fprintf(os.Stderr, "centrol proxy: panic: %v\n", r)
-			os.Exit(ui.ExitRuntimeError)
+			end("panic", ui.ExitRuntimeError, func() {
+				fmt.Fprintf(os.Stderr, "centrol proxy: panic: %v\n", r)
+			})
 		}
 	}()
-	// printSummaryAndClear is the shared "about to exit early" sequence
-	// for every config-resolution fatalf/os.Exit below — each one is a
-	// trappable exit path per section 5, even ones that fire before the
-	// wrapped MCP server ever starts.
-	printSummaryAndClear := func() {
-		printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-		clearMarker()
-	}
 
-	threshold, threshSource, err := policy.ResolveMassMutationThreshold(resolver)
-	if err != nil {
-		printSummaryAndClear()
-		fatalHint(ui.ExitUserError, []string{"run `centrol config` to fix it interactively, or edit .centrol/config.toml / ~/.centrol/config.toml directly"},
-			"%v", err)
+	var threshold int
+	var threshSource string
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		threshold, threshSource, e = policy.ResolveMassMutationThreshold(resolver)
+		return e
+	}); err != nil {
+		end("resolve_mass_mutation_threshold_failed", ui.ExitUserError, func() {
+			ui.Errorf(os.Stderr, []string{"run `centrol config` to fix it interactively, or edit .centrol/config.toml / ~/.centrol/config.toml directly"},
+				"%v", err)
+		})
+		return
 	}
 
 	contract := policy.DefaultContract(policy.KindProxy, runID, root)
@@ -172,10 +185,16 @@ func cmdProxyRun(args []string) {
 	gc := newGuardedContract(contract)
 	_ = threshSource // available for a future --verbose provenance line; not surfaced by default to keep startup output quiet
 
-	observeFromConfig, _, cerr := policy.ResolveObserveMode(resolver)
-	if cerr != nil {
-		printSummaryAndClear()
-		fatalf("centrol proxy: %v", cerr)
+	var observeFromConfig bool
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		observeFromConfig, _, e = policy.ResolveObserveMode(resolver)
+		return e
+	}); err != nil {
+		end("resolve_observe_mode_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+		})
+		return
 	}
 	observe := observeFlag || observeFromConfig
 	if observe {
@@ -198,28 +217,65 @@ func cmdProxyRun(args []string) {
 	// this step to do for useHTTP.
 	if !useHTTP {
 		identity := policy.ServerIdentity(fields[0], fields[1:])
-		allowed, _, err := policy.ResolveAllowedServers(resolver)
-		if err != nil {
-			printSummaryAndClear()
-			fatalf("centrol proxy: %v", err)
+		var allowed []string
+		if err := runSetup(ctx, end, signalOutcome, func() error {
+			var e error
+			allowed, _, e = policy.ResolveAllowedServers(resolver)
+			return e
+		}); err != nil {
+			end("resolve_allowed_servers_failed", 1, func() {
+				fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+			})
+			return
 		}
-		strict, _, err := policy.ResolveStrictMatching(resolver)
-		if err != nil {
-			printSummaryAndClear()
-			fatalf("centrol proxy: %v", err)
+		var strict bool
+		if err := runSetup(ctx, end, signalOutcome, func() error {
+			var e error
+			strict, _, e = policy.ResolveStrictMatching(resolver)
+			return e
+		}); err != nil {
+			end("resolve_strict_matching_failed", 1, func() {
+				fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+			})
+			return
 		}
 		if !observe && !policy.MatchesAllowlist(identity, target, allowed, strict) {
-			decision := promptServerAllowlist(identity, target)
+			// promptServerAllowlist blocks on stdin (with its own
+			// timeout) — exactly the kind of step runSetup exists for:
+			// a signal arriving while a user is being prompted must
+			// still interrupt main's own goroutine via ctx, not have the
+			// signal watch call end/Exit itself.
+			var decision allowlistDecision
+			if err := runSetup(ctx, end, signalOutcome, func() error {
+				decision = promptServerAllowlist(identity, target)
+				return nil
+			}); err != nil {
+				// promptServerAllowlist's own step func never returns an
+				// error; this branch is unreachable in practice, but
+				// every runSetup call site handles its error the same
+				// way on principle.
+				end("allowlist_prompt_failed", 1, func() {
+					fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+				})
+				return
+			}
 			switch decision {
 			case allowlistDeny:
-				fmt.Fprintf(os.Stderr, "centrol: denied — %s is not on the MCP server allowlist\n", identity)
-				printSummaryAndClear()
-				os.Exit(ui.ExitPolicyBlock)
+				end("allowlist_denied", ui.ExitPolicyBlock, func() {
+					fmt.Fprintf(os.Stderr, "centrol: denied — %s is not on the MCP server allowlist\n", identity)
+				})
+				return
 			case allowlistAdd:
-				src, err := resolver.WriteConfig(policy.KeyAllowedServers, append(allowed, identity))
-				if err != nil {
-					printSummaryAndClear()
-					fatalf("centrol proxy: adding %s to the allowlist: %v", identity, err)
+				var src string
+				if err := runSetup(ctx, end, signalOutcome, func() error {
+					var e error
+					src, e = resolver.WriteConfig(policy.KeyAllowedServers, append(allowed, identity))
+					return e
+				}); err != nil {
+					end("allowlist_add_failed", 1, func() {
+						fmt.Fprintf(os.Stderr, "centrol proxy: adding %s to the allowlist: %v\n", identity, err)
+					})
+					return
 				}
 				_ = emit(runID, "proxy", "policy.amend", map[string]interface{}{
 					"action": "add_to_allowlist", "server": identity, "source": src,
@@ -274,20 +330,38 @@ func cmdProxyRun(args []string) {
 		}
 	}()
 
-	promptTimeoutSec, _, err := policy.ResolvePromptTimeoutSeconds(resolver)
-	if err != nil {
-		printSummaryAndClear()
-		fatalf("centrol proxy: %v", err)
+	var promptTimeoutSec int
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		promptTimeoutSec, _, e = policy.ResolvePromptTimeoutSeconds(resolver)
+		return e
+	}); err != nil {
+		end("resolve_prompt_timeout_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+		})
+		return
 	}
-	allowSessionAmend, _, err := policy.ResolveAllowSessionAmend(resolver)
-	if err != nil {
-		printSummaryAndClear()
-		fatalf("centrol proxy: %v", err)
+	var allowSessionAmend bool
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		allowSessionAmend, _, e = policy.ResolveAllowSessionAmend(resolver)
+		return e
+	}); err != nil {
+		end("resolve_allow_session_amend_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+		})
+		return
 	}
-	additionalBlockPaths, _, err := policy.ResolveAdditionalBlockPaths(resolver)
-	if err != nil {
-		printSummaryAndClear()
-		fatalf("centrol proxy: %v", err)
+	var additionalBlockPaths []string
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		additionalBlockPaths, _, e = policy.ResolveAdditionalBlockPaths(resolver)
+		return e
+	}); err != nil {
+		end("resolve_additional_block_paths_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+		})
+		return
 	}
 	if len(additionalBlockPaths) > 0 {
 		// Canonicalized ONCE here, at config load, exactly like the
@@ -301,10 +375,16 @@ func cmdProxyRun(args []string) {
 		gc = newGuardedContract(contract)
 	}
 
-	mcpCallTimeoutSec, _, err := policy.ResolveMCPCallTimeoutSeconds(resolver)
-	if err != nil {
-		printSummaryAndClear()
-		fatalf("centrol proxy: %v", err)
+	var mcpCallTimeoutSec int
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		mcpCallTimeoutSec, _, e = policy.ResolveMCPCallTimeoutSeconds(resolver)
+		return e
+	}); err != nil {
+		end("resolve_mcp_call_timeout_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+		})
+		return
 	}
 
 	// http_timeout_seconds/http_max_retries only govern an HTTP target
@@ -313,15 +393,25 @@ func cmdProxyRun(args []string) {
 	// an unrelated stdio run.
 	var httpTimeoutSec, httpMaxRetries int
 	if useHTTP {
-		httpTimeoutSec, _, err = policy.ResolveProxyHTTPTimeoutSeconds(resolver)
-		if err != nil {
-			printSummaryAndClear()
-			fatalf("centrol proxy: %v", err)
+		if err := runSetup(ctx, end, signalOutcome, func() error {
+			var e error
+			httpTimeoutSec, _, e = policy.ResolveProxyHTTPTimeoutSeconds(resolver)
+			return e
+		}); err != nil {
+			end("resolve_http_timeout_failed", 1, func() {
+				fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+			})
+			return
 		}
-		httpMaxRetries, _, err = policy.ResolveProxyHTTPMaxRetries(resolver)
-		if err != nil {
-			printSummaryAndClear()
-			fatalf("centrol proxy: %v", err)
+		if err := runSetup(ctx, end, signalOutcome, func() error {
+			var e error
+			httpMaxRetries, _, e = policy.ResolveProxyHTTPMaxRetries(resolver)
+			return e
+		}); err != nil {
+			end("resolve_http_max_retries_failed", 1, func() {
+				fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+			})
+			return
 		}
 	}
 
@@ -339,11 +429,34 @@ func cmdProxyRun(args []string) {
 	// every evaluation in this run reads through gc instead.
 	interceptor.ContractFunc = gc.get
 
-	// Unlike centrol guard (which hands signal responsibility to
-	// terminal.Run's own forwarding once the wrapped agent starts),
-	// neither proxy.Run nor proxy.RunTarget has signal handling of its
-	// own — they manage the target directly. So the early handler stays
-	// armed for the whole call instead of handing off partway through.
+	// Governor.Run registers its own signal watch for the duration of
+	// the call (Pass 3.9c Final, Section 2 "Signals") — unlike centrol
+	// guard, it manages the target directly with no separate forwarding
+	// mechanism to hand signal responsibility off to. So this
+	// function's own pre-Run watch steps aside right here, immediately
+	// before the call, rather than staying armed alongside Run's.
+	stopSignalWatch()
+	// checkCancelled AFTER stopSignalWatch, not before: stopSignalWatch
+	// (newSignalWatch's own stop, cmd/centrol/summary.go — which settles
+	// the underlying WatchSignals watch but deliberately never
+	// unregisters it; see that doc comment) blocks until the watch's
+	// goroutine has made its final, settled decision about any signal
+	// it may have received, so this check sees the complete truth for
+	// the entire pre-Run window — including a signal landing in the
+	// plain synchronous stretch since the last runSetup call above
+	// (building the interceptor, wiring gc.get, nothing ctx.Done()
+	// could otherwise interrupt), AND a signal arriving in the exact
+	// instant of this handoff itself. Checking before stopSignalWatch
+	// returned used to miss that second case: a signal this watch
+	// itself had already consumed, but not yet finished processing,
+	// could still call onReceived/cancel() strictly after this check
+	// had already run and after this function had already moved on
+	// into g.Run — a real signal, swallowed by this watch, with no
+	// reader left for the cancellation it eventually produced. See
+	// Governor.WatchSignals' doc comment in internal/governor/run.go
+	// for the fix (and for why this watch's registration is left
+	// active rather than unregistered here).
+	checkCancelled(end, signalOutcome)
 	var runErr error
 	if useHTTP {
 		httpTarget := &transport.HTTPTarget{
@@ -351,11 +464,10 @@ func cmdProxyRun(args []string) {
 			Timeout:    time.Duration(httpTimeoutSec) * time.Second,
 			MaxRetries: httpMaxRetries,
 		}
-		runErr = proxy.RunTarget(httpTarget, interceptor, os.Stdin, os.Stdout, os.Stderr)
+		runErr = g.Run(context.Background(), httpTarget, interceptor, os.Stdin, os.Stdout, os.Stderr)
 	} else {
-		runErr = proxy.Run(proxy.Target{Command: fields[0], Args: fields[1:]}, interceptor, os.Stdin, os.Stdout, os.Stderr)
+		runErr = g.Run(context.Background(), transport.NewStdioTarget(fields[0], fields[1:], os.Stderr), interceptor, os.Stdin, os.Stdout, os.Stderr)
 	}
-	stopEarlySignal()
 	close(stopScope)
 
 	endPayload := map[string]interface{}{}
@@ -366,14 +478,16 @@ func cmdProxyRun(args []string) {
 		counters.markStreamError()
 	}
 	_ = emit(runID, "proxy", "run.end", endPayload)
-	clearMarker()
 
-	// Printed on every trappable exit from here: normal completion and
-	// the runErr path below. Never gated by --quiet — printRunSummary
-	// writes straight to os.Stderr, not through logger.
-	printRunSummary(os.Stderr, runID, ledgerPath(root), started, counters)
-
+	// end prints the run summary and clears the marker on every
+	// trappable exit from here: normal completion, and the runErr branch
+	// below. Never gated by --quiet — printRunSummary writes straight to
+	// os.Stderr, not through logger.
 	if runErr != nil {
-		fatalf("centrol proxy: %v", runErr)
+		end("agent_run_error", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", runErr)
+		})
+		return
 	}
+	end("agent_exit", 0, nil)
 }
