@@ -122,3 +122,20 @@ func (t *StdioTarget) Wait() error {
 	}
 	return t.cmd.Wait()
 }
+
+// Kill forcibly terminates the target process via SIGKILL — the
+// escalation governor.Governor.Run reaches for (audit item 4g) when a
+// target ignores Stop's signal (its stdin closing) and never exits on
+// its own within the configured target_exit_timeout_seconds. Safe to
+// call even if Start never ran or already failed (t.cmd nil) or the
+// process has already exited (Process.Kill's own error in that case
+// is intentionally discarded here — by the time this runs, the only
+// thing that matters is that nothing is left running, and "already
+// dead" is exactly the outcome being asked for anyway).
+func (t *StdioTarget) Kill() error {
+	if t.cmd == nil || t.cmd.Process == nil {
+		return nil
+	}
+	_ = t.cmd.Process.Kill()
+	return nil
+}

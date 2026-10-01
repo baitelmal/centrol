@@ -273,6 +273,11 @@ func configProxyMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver)
 			fmt.Fprintf(out, "error: %v\n", err)
 			return
 		}
+		targetExitTimeout, targetExitTimeoutSrc, err := policy.ResolveTargetExitTimeoutSeconds(resolver)
+		if err != nil {
+			fmt.Fprintf(out, "error: %v\n", err)
+			return
+		}
 
 		fmt.Fprintln(out, "\nProxy")
 		printLockable(out, "additional_block_paths", fmt.Sprintf("%v", blockPaths), blockPathsSrc)
@@ -281,12 +286,14 @@ func configProxyMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver)
 		printLockable(out, "target_url", targetURL, targetURLSrc)
 		printLockable(out, "http_timeout_seconds", httpTimeout, httpTimeoutSrc)
 		printLockable(out, "http_max_retries", httpMaxRetries, httpMaxRetriesSrc)
+		printLockable(out, "target_exit_timeout_seconds", targetExitTimeout, targetExitTimeoutSrc)
 		fmt.Fprintln(out, "  1) Add a path to additional_block_paths")
 		fmt.Fprintln(out, "  2) Edit mcp_call_timeout_seconds")
 		fmt.Fprintln(out, "  3) Toggle strict_matching")
 		fmt.Fprintln(out, "  4) Edit target_url")
 		fmt.Fprintln(out, "  5) Edit http_timeout_seconds")
 		fmt.Fprintln(out, "  6) Edit http_max_retries")
+		fmt.Fprintln(out, "  7) Edit target_exit_timeout_seconds")
 		fmt.Fprintln(out, "  b) Back")
 		fmt.Fprint(out, "> ")
 
@@ -404,6 +411,28 @@ func configProxyMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver)
 				continue
 			}
 			fmt.Fprintf(out, "Set http_max_retries = %d (%s). Effective on the next `centrol proxy` run.\n", v, src)
+		case "7":
+			if lockedByEnterprise(targetExitTimeoutSrc) {
+				fmt.Fprintln(out, "target_exit_timeout_seconds is locked by enterprise policy and cannot be edited here")
+				continue
+			}
+			fmt.Fprintf(out, "New value (seconds, floor %d): ", policy.MinTargetExitTimeoutSecs)
+			raw := readMenuLine(in)
+			v, err := strconv.Atoi(raw)
+			if err != nil {
+				fmt.Fprintf(out, "error: %q is not an integer\n", raw)
+				continue
+			}
+			if v < policy.MinTargetExitTimeoutSecs {
+				fmt.Fprintf(out, "error: target_exit_timeout_seconds = %d is below the minimum of %d\n", v, policy.MinTargetExitTimeoutSecs)
+				continue
+			}
+			src, err := resolver.WriteConfig(policy.KeyTargetExitTimeoutSecs, v)
+			if err != nil {
+				fmt.Fprintf(out, "error: %v\n", err)
+				continue
+			}
+			fmt.Fprintf(out, "Set target_exit_timeout_seconds = %d (%s). Effective on the next `centrol proxy` run.\n", v, src)
 		default:
 			fmt.Fprintln(out, "Not a recognized option.")
 		}
@@ -634,6 +663,9 @@ func configViewEffective(out io.Writer, resolver *policy.Resolver) {
 	}
 	if v, s, err := policy.ResolveProxyHTTPMaxRetries(resolver); err == nil {
 		printRow("proxy.http_max_retries", v, s)
+	}
+	if v, s, err := policy.ResolveTargetExitTimeoutSeconds(resolver); err == nil {
+		printRow("proxy.target_exit_timeout_seconds", v, s)
 	}
 	if v, s, err := policy.ResolvePromptTimeoutSeconds(resolver); err == nil {
 		printRow("gate.prompt_timeout_seconds", v, s)

@@ -401,6 +401,27 @@ func cmdProxyRun(args []string) {
 		return
 	}
 
+	// target_exit_timeout_seconds governs how long Governor.Run waits
+	// for the target subprocess to exit after Stop (closing its stdin)
+	// before escalating to SIGKILL (audit item 4g) — meaningful only
+	// for a stdio target (transport.StdioTarget implements Kill;
+	// transport.HTTPTarget has no subprocess), but resolved regardless
+	// of useHTTP since a misconfigured value should fail the same way
+	// every other resolved config key does, not silently depending on
+	// which target kind this run happens to use.
+	var targetExitTimeoutSec int
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		targetExitTimeoutSec, _, e = policy.ResolveTargetExitTimeoutSeconds(resolver)
+		return e
+	}); err != nil {
+		end("resolve_target_exit_timeout_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+		})
+		return
+	}
+	g.TargetExitTimeout = time.Duration(targetExitTimeoutSec) * time.Second
+
 	// http_timeout_seconds/http_max_retries only govern an HTTP target
 	// (transport.HTTPTarget's Timeout/MaxRetries below) — resolved only
 	// for useHTTP so a misconfigured value in that section never fails

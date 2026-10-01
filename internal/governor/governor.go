@@ -53,6 +53,15 @@ type Governor struct {
 	sc     schema
 
 	run runState
+
+	// TargetExitTimeout bounds how long Run's waitForTargetExit (run.go,
+	// audit item 4g) waits for a targetWaiter's Wait() to return after
+	// Stop has already signaled the target to shut down, before
+	// escalating to targetKiller.Kill(). Zero (the default for a
+	// Governor built via New, or in any existing test) falls back to
+	// DefaultTargetExitTimeout; cmd_proxy.go sets this explicitly from
+	// the resolved proxy.target_exit_timeout_seconds policy value.
+	TargetExitTimeout time.Duration
 }
 
 // New loads schemas/event.v1.json (embedded at build time) and binds to

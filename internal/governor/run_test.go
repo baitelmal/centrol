@@ -1088,3 +1088,168 @@ func TestGovernorRunStopsOnSIGINT(t *testing.T) {
 		t.Fatalf("expected Governor.ExitCode() == 130 after SIGINT, got %d", got)
 	}
 }
+
+// hangingWaiterTarget ignores Stop() as far as its own process
+// lifetime is concerned — Receive's channel closes normally (so the
+// target->client pump ends cleanly), but Wait() never returns on its
+// own. It only exits once Kill() is called, letting this test exercise
+// the audit's 4g timeout+SIGKILL escalation path without a real OS
+// subprocess.
+type hangingWaiterTarget struct {
+	ch         chan []byte
+	killed     chan struct{}
+	killedOnce sync.Once
+}
+
+func newHangingWaiterTarget() *hangingWaiterTarget {
+	return &hangingWaiterTarget{ch: make(chan []byte), killed: make(chan struct{})}
+}
+func (h *hangingWaiterTarget) Start(context.Context) error     { return nil }
+func (h *hangingWaiterTarget) Send([]byte) error               { return nil }
+func (h *hangingWaiterTarget) Receive() (<-chan []byte, error) { return h.ch, nil }
+func (h *hangingWaiterTarget) Stop() error {
+	close(h.ch)
+	return nil
+}
+func (h *hangingWaiterTarget) Wait() error {
+	<-h.killed
+	return fmt.Errorf("process killed")
+}
+func (h *hangingWaiterTarget) Kill() error {
+	h.killedOnce.Do(func() { close(h.killed) })
+	return nil
+}
+
+// TestGovernorRunKillsHangingTargetAfterExitTimeout is the audit's 4g
+// fix: a target whose Wait() never returns on its own (ignoring Stop's
+// signal entirely) must be killed once TargetExitTimeout elapses, Run
+// must still complete rather than hang forever, and a policy.violation
+// with reason "target_exit_timeout" must be recorded.
+func TestGovernorRunKillsHangingTargetAfterExitTimeout(t *testing.T) {
+	rec := &recorder{}
+	in := proxy.NewInterceptor("run-exit-timeout", testContract(), rec.emit, nil, true)
+
+	clientIn := strings.NewReader("") // EOF immediately: nothing to forward.
+	clientOut := &safeBuffer{}
+	diag := &safeBuffer{}
+
+	g := &Governor{TargetExitTimeout: 150 * time.Millisecond}
+	ht := newHangingWaiterTarget()
+
+	done := make(chan struct{})
+	go func() {
+		g.Run(context.Background(), ht, in, clientIn, clientOut, diag)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Governor.Run did not return after the hanging target should have been killed on timeout")
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	found := false
+	for i, typ := range rec.types {
+		if typ == "policy.violation" && rec.entries[i]["reason"] == "target_exit_timeout" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a policy.violation with reason target_exit_timeout, got types=%v entries=%v", rec.types, rec.entries)
+	}
+}
+
+// TestGovernorRunDoesNotKillATargetThatExitsPromptly confirms the
+// timeout path is never reached for the ordinary case: a target whose
+// Wait() returns well within TargetExitTimeout must never have Kill
+// called on it.
+func TestGovernorRunDoesNotKillATargetThatExitsPromptly(t *testing.T) {
+	rec := &recorder{}
+	in := proxy.NewInterceptor("run-exit-prompt", testContract(), rec.emit, nil, true)
+
+	clientIn := strings.NewReader("")
+	clientOut := &safeBuffer{}
+	diag := &safeBuffer{}
+
+	g := &Governor{TargetExitTimeout: 2 * time.Second}
+	ht := newHangingWaiterTarget()
+	// Simulate a target that exits on its own almost immediately after
+	// Stop, well inside the timeout — Kill (closing `killed`) stands in
+	// for that prompt exit here, since Wait() is gated on it either way.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		_ = ht.Kill()
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		g.Run(context.Background(), ht, in, clientIn, clientOut, diag)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Governor.Run did not return for a target that exits promptly")
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	for i, typ := range rec.types {
+		if typ == "policy.violation" && rec.entries[i]["reason"] == "target_exit_timeout" {
+			t.Fatalf("expected no target_exit_timeout violation for a target that exited promptly, got entries=%v", rec.entries)
+		}
+	}
+}
+
+// TestGovernorRunKillsRealHangingSubprocessAfterExitTimeout is the
+// end-to-end version of TestGovernorRunKillsHangingTargetAfterExitTimeout:
+// a real sh subprocess that traps SIGTERM (so StdioTarget.Stop's
+// stdin-close alone never ends it) and loops forever must still be
+// killed (SIGKILL, which cannot be trapped) once TargetExitTimeout
+// elapses, with Run completing and a target_exit_timeout violation
+// recorded.
+func TestGovernorRunKillsRealHangingSubprocessAfterExitTimeout(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh not available in this environment")
+	}
+	rec := &recorder{}
+	in := proxy.NewInterceptor("run-real-exit-timeout", testContract(), rec.emit, nil, true)
+
+	// Ignoring stdin EOF (never reads it) and trapping TERM means
+	// neither half of Stop's usual "close stdin, then the process
+	// reads EOF and exits" contract, nor a plain SIGTERM, can end this
+	// script — only SIGKILL can.
+	script := `trap '' TERM; while true; do sleep 0.05; done`
+	clientIn := strings.NewReader("") // EOF immediately: nothing to forward.
+	var clientOut, diag safeBuffer
+
+	g := &Governor{TargetExitTimeout: 300 * time.Millisecond}
+	st := transport.NewStdioTarget("sh", []string{"-c", script}, &diag)
+
+	done := make(chan struct{})
+	go func() {
+		g.Run(context.Background(), st, in, clientIn, &clientOut, &diag)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Governor.Run did not return after a real hanging subprocess should have been SIGKILLed on timeout")
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	found := false
+	for i, typ := range rec.types {
+		if typ == "policy.violation" && rec.entries[i]["reason"] == "target_exit_timeout" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a policy.violation with reason target_exit_timeout, got types=%v entries=%v", rec.types, rec.entries)
+	}
+}

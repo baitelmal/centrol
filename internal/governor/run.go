@@ -56,6 +56,27 @@ type targetWaiter interface {
 	Wait() error
 }
 
+// targetKiller is an optional capability a RunTransport may implement
+// to forcibly terminate itself — e.g. transport.StdioTarget.Kill,
+// which sends SIGKILL to the subprocess. Audit fix (4g): Run's own
+// waitForTargetExit reaches for this when a targetWaiter's Wait()
+// doesn't return within TargetExitTimeout after Stop already signaled
+// shutdown. Not part of RunTransport or targetWaiter themselves, since
+// a transport with nothing to forcibly kill (HTTPTarget has no
+// subprocess) simply doesn't implement it — same optional-capability
+// pattern as targetErrReporter/targetWaiter.
+type targetKiller interface {
+	Kill() error
+}
+
+// DefaultTargetExitTimeout is the bound waitForTargetExit falls back
+// to when a Governor's TargetExitTimeout field is left at its zero
+// value — e.g. existing callers/tests built before this field existed.
+// Mirrors policy.DefaultTargetExitTimeoutSecs; cmd_proxy.go always sets
+// TargetExitTimeout explicitly from the resolved policy value, so this
+// constant only matters as this package's own standalone default.
+const DefaultTargetExitTimeout = 10 * time.Second
+
 // Phase is a run's lifecycle phase, owned exclusively by the Governor's
 // run/change hand (Stop/MarkStopped below). Phase is for diagnostics
 // and for Stop's own first-writer-wins guard — Governor.Run's pump
@@ -700,14 +721,48 @@ func (g *Governor) Run(ctx context.Context, target RunTransport, in *proxy.Inter
 		_ = targetStop()
 	}()
 
+	// Audit fix (4g): killOnShutdownTimeout is shared by both waits
+	// below (the drain, and the explicit targetWaiter.Wait()) so a
+	// target that ignores Stop's signal gets SIGKILLed — and the
+	// policy.violation for it logged — at most once per Run call,
+	// regardless of which wait is the one that actually times out
+	// first. Which one that is depends on the transport: for
+	// StdioTarget, the drain is normally the one that hangs (its
+	// Receive channel is the stdout pipe, which a target that ignores
+	// stdin EOF never closes, so the target->client pump's loop below
+	// never ends on its own); for a transport whose Receive channel can
+	// close independently of the process actually exiting, Wait()
+	// itself is the one that would otherwise hang forever instead.
+	// Bounding only one of the two left the other able to hang Run
+	// indefinitely depending on which shape of RunTransport was in
+	// play — this bounds whichever one actually blocks.
+	timeout := g.TargetExitTimeout
+	if timeout <= 0 {
+		timeout = DefaultTargetExitTimeout
+	}
+	var killOnce sync.Once
+	killOnTimeout := func() {
+		killOnce.Do(func() {
+			if k, ok := target.(targetKiller); ok {
+				_ = k.Kill()
+			}
+			_ = in.Emit(in.RunID, "proxy", "policy.violation", map[string]interface{}{
+				"reason":          "target_exit_timeout",
+				"timeout_seconds": timeout.Seconds(),
+			})
+		})
+	}
+
 	// The target -> client goroutine's loop ends when its Receive channel
 	// closes: for StdioTarget, that follows the process exiting, which
 	// (if it reads until EOF) follows targetStop() above closing stdin;
 	// for HTTPTarget, Stop() closes the channel directly. Run must not
 	// return (and the caller must not treat clientOut as final) until
 	// this goroutine actually has — it is the only other writer to
-	// clientOut.
-	drainErr := <-targetToClientDone
+	// clientOut. Bounded by timeout/killOnTimeout above: a target that
+	// ignores Stop's signal and never closes its output on its own
+	// would otherwise hang this receive, and so Run, forever.
+	drainErr := awaitWithTimeout(targetToClientDone, timeout, killOnTimeout)
 
 	// Fallback signal: guarantees targetStop() has fired even if the
 	// client pump never reached EOF — e.g. the target ended on its own,
@@ -722,10 +777,16 @@ func (g *Governor) Run(ctx context.Context, target RunTransport, in *proxy.Inter
 	// cmd.Wait()). Not every RunTransport has such a phase — a
 	// request/response transport like HTTPTarget has nothing left to wait
 	// for once its receive channel is closed — so this is an optional
-	// check, same pattern as targetErrReporter above.
+	// check, same pattern as targetErrReporter above. Bounded the same
+	// way as the drain above, via the same killOnTimeout (idempotent,
+	// so a drain that already timed out and killed the target doesn't
+	// log a second violation here even if this wait also has to time
+	// out before observing that kill's effect).
 	var waitErr error
 	if w, ok := target.(targetWaiter); ok {
-		waitErr = w.Wait()
+		waitDone := make(chan error, 1)
+		go func() { waitDone <- w.Wait() }()
+		waitErr = awaitWithTimeout(waitDone, timeout, killOnTimeout)
 		// A signal sent to this process's own process group (a
 		// foreground Ctrl+C, or a test's syscall.Kill(-pid, sig)) lands
 		// on the target subprocess directly, via the OS, independent of
@@ -810,4 +871,28 @@ func (g *Governor) Run(ctx context.Context, target RunTransport, in *proxy.Inter
 		return fmt.Errorf("governor: run panicked (exit code %d)", g.ExitCode())
 	}
 	return nil
+}
+
+// awaitWithTimeout blocks on done but no longer than timeout; if it
+// elapses first, onTimeout runs exactly once (its own sync.Once, if
+// it's meant to run at most once across more than one
+// awaitWithTimeout call — see killOnTimeout in Run, above, for why
+// that matters here) and this then falls back to blocking on done
+// unboundedly. Audit fix (4g): used for both of Run's two points that
+// wait on a target to actually finish exiting (the drain, and the
+// optional targetWaiter.Wait()) — either of which a target that
+// ignores Stop's shutdown signal could otherwise block forever,
+// depending on the transport. onTimeout is expected to force done
+// toward resolving (e.g. SIGKILL via targetKiller) — awaitWithTimeout
+// itself does not know how to make that happen, only when to ask for
+// it and that it must still wait, unboundedly, for the real answer
+// afterward rather than fabricating one.
+func awaitWithTimeout(done <-chan error, timeout time.Duration, onTimeout func()) error {
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+	}
+	onTimeout()
+	return <-done
 }
