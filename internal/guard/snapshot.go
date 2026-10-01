@@ -309,7 +309,18 @@ func Restore(repoRoot, snapshotDir string, git *GitRunner) (RestoreOutcome, erro
 		return out, fmt.Errorf("restore: reading stash.diff: %w", err)
 	}
 	if strings.TrimSpace(string(diffBytes)) != "" {
-		tmp, err := os.CreateTemp("", "centrol-restore-*.diff")
+		// Audit fix (4f): this used to land in the system temp directory
+		// (os.CreateTemp("", ...)), outside .centrol entirely — not
+		// repo-scoped, not covered by .centrol's own permissions, and not
+		// cleaned up alongside the rest of .centrol if a caller ever
+		// wipes that directory wholesale. restoreTmpDir() is a
+		// .centrol-rooted directory for exactly this kind of
+		// restore-scoped scratch file.
+		restoreTmpDir := filepath.Join(repoRoot, ".centrol", "restore-tmp")
+		if err := os.MkdirAll(restoreTmpDir, 0o700); err != nil {
+			return out, err
+		}
+		tmp, err := os.CreateTemp(restoreTmpDir, "restore-*.diff")
 		if err != nil {
 			return out, err
 		}

@@ -807,3 +807,60 @@ func TestGitRunnerPassesMinimalEnv(t *testing.T) {
 		t.Fatalf("expected non-PATH/HOME/GIT_* vars to be excluded, got env:\n%s", envStr)
 	}
 }
+
+// TestRestoreNeverWritesToSystemTempDir is the audit's 4f fix: Restore
+// used to stage its diff-apply temp file under the system temp
+// directory via os.CreateTemp("", ...); it must now stay under
+// .centrol/restore-tmp so it's repo-scoped and private.
+func TestRestoreNeverWritesToSystemTempDir(t *testing.T) {
+	repo := initRepo(t)
+	ignore, err := LoadIgnore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nvar x = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapDir := filepath.Join(t.TempDir(), "run-1")
+	if err := Snapshot(repo, snapDir, ignore, testGitRunner(t)); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	before, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeNames := map[string]bool{}
+	for _, e := range before {
+		beforeNames[e.Name()] = true
+	}
+
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nvar x = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Restore(repo, snapDir, testGitRunner(t)); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	after, err := os.ReadDir(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range after {
+		if !beforeNames[e.Name()] && strings.Contains(e.Name(), "centrol-restore") {
+			t.Fatalf("expected no centrol-restore temp file in the system temp dir, found %s", e.Name())
+		}
+	}
+
+	restoreTmpDir := filepath.Join(repo, ".centrol", "restore-tmp")
+	info, err := os.Stat(restoreTmpDir)
+	if err != nil {
+		t.Fatalf("expected %s to exist after a Restore with a non-empty diff: %v", restoreTmpDir, err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("expected %s to be a directory", restoreTmpDir)
+	}
+}
