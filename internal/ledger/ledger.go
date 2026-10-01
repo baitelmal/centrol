@@ -99,7 +99,11 @@ func Open(basePath string, rotateAtMB int) (*Ledger, error) {
 	if ext == "" {
 		ext = ".jsonl"
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0700/0600: the ledger is deliberately full-fidelity (see Append's
+	// doc comment) and can carry MCP payload content, including
+	// whatever secrets an agent's own traffic happens to contain — the
+	// directory and every file in it must not be world-readable.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("ledger: creating dir %s: %w", dir, err)
 	}
 	return &Ledger{
@@ -140,7 +144,7 @@ func (l *Ledger) writeMeta(m meta) error {
 		return err
 	}
 	tmp := l.metaPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, l.metaPath)
@@ -337,7 +341,7 @@ func (l *Ledger) appendRawBytes(segPath, run, src, typ string, payload json.RawM
 	line = append(line, []byte(`"}`)...)
 	line = append(line, '\n')
 
-	f, err := os.OpenFile(segPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(segPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return Entry{}, err
 	}

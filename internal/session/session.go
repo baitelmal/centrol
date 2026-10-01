@@ -41,7 +41,11 @@ type RunMarker struct {
 // previous marker — only one run is "current" at a time in this
 // single-binary, no-daemon design.
 func WriteCurrentRun(centrolDir string, m RunMarker) error {
-	if err := os.MkdirAll(centrolDir, 0o755); err != nil {
+	// 0700/0600: everything under .centrol/ is private to the repo
+	// owner — RunMarker includes RepoRoot and AllowedPaths, which are
+	// not secrets themselves, but the directory-wide bar (see ledger.Open
+	// and AppendScopeRequest below, same rule) is simplest kept uniform.
+	if err := os.MkdirAll(centrolDir, 0o700); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(m, "", "  ")
@@ -49,7 +53,7 @@ func WriteCurrentRun(centrolDir string, m RunMarker) error {
 		return err
 	}
 	tmp := filepath.Join(centrolDir, currentRunFile+".tmp")
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(centrolDir, currentRunFile))
@@ -92,14 +96,14 @@ type ScopeRequest struct {
 // under .centrol/, which the fsnotify watcher hard-excludes — a live
 // run notices new requests via PollScopeRequests, not the watcher.
 func AppendScopeRequest(centrolDir, path string) error {
-	if err := os.MkdirAll(centrolDir, 0o755); err != nil {
+	if err := os.MkdirAll(centrolDir, 0o700); err != nil {
 		return err
 	}
 	b, err := json.Marshal(ScopeRequest{Path: path, TS: time.Now().UTC()})
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(centrolDir, scopeRequestsFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(filepath.Join(centrolDir, scopeRequestsFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}

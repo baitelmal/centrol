@@ -103,8 +103,13 @@ func cmdProxyInstall(args []string) {
 		return
 	}
 
+	// 0600: an MCP client config can list a remote server's url with an
+	// embedded token/credential (see remoteURL below) — both the backup
+	// and the rewritten file keep whatever permissions the client's own
+	// config had, but centrol itself writes both at the restrictive bar
+	// rather than defaulting to world-readable.
 	backupPath := fmt.Sprintf("%s.centrol-backup-%s", path, time.Now().UTC().Format("20060102T150405"))
-	if err := os.WriteFile(backupPath, raw, 0o644); err != nil {
+	if err := os.WriteFile(backupPath, raw, 0o600); err != nil {
 		fatalf("centrol proxy install: writing backup before touching %s: %v", path, err)
 	}
 
@@ -173,7 +178,7 @@ func cmdProxyInstall(args []string) {
 	if err != nil {
 		fatalf("centrol proxy install: encoding patched config: %v", err)
 	}
-	if err := os.WriteFile(path, out, 0o644); err != nil {
+	if err := os.WriteFile(path, out, 0o600); err != nil {
 		fatalf("centrol proxy install: writing %s: %v", path, err)
 	}
 

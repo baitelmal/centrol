@@ -158,11 +158,16 @@ func (l *LocalFileSource) Write(key string, value interface{}) error {
 	}
 	doc[section][k] = value
 
-	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
+	// 0700/0600: config.toml can carry an operator-entered proxy.target_url
+	// with embedded credentials (e.g. a token in the URL's query string or
+	// userinfo) — the .centrol-rooted directory and the file itself must
+	// not be world-readable, matching the same bar applied to the ledger
+	// and session markers (internal/ledger.Open, internal/session).
+	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
 		return err
 	}
 	tmp := l.path + ".tmp"
-	if err := os.WriteFile(tmp, writeTOMLSubset(doc), 0o644); err != nil {
+	if err := os.WriteFile(tmp, writeTOMLSubset(doc), 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, l.path)
