@@ -77,6 +77,34 @@ func emitFunc(g *governor.Governor) func(run, src, typ string, payload map[strin
 	}
 }
 
+// tamperDetectionEmit builds the onTamper callback passed to
+// (*governor.Governor).WatchForTamper, shared by cmd_guard.go and
+// cmd_proxy.go (src "guard"/"proxy" respectively) so the two stay
+// symmetric: it converts TamperDetection.Path to the same
+// repo-relative, forward-slash form every other guard/proxy payload
+// already uses (see guard.Watcher's own path handling), then emits
+// policy.tamper_detected exactly like any other governed signal. A
+// failed emit is reported to stderr rather than discarded — matching
+// checkedEmit's stance in internal/guard/watch.go that silently
+// dropping a failed emit can leave a run's ledger looking clean when
+// an entire class of events went unrecorded.
+func tamperDetectionEmit(root, runID, src string, emit func(run, src, typ string, payload map[string]interface{}) error) func(ledger.TamperDetection) {
+	return func(td ledger.TamperDetection) {
+		path := filepath.ToSlash(td.Path)
+		if rel, err := filepath.Rel(root, td.Path); err == nil {
+			path = filepath.ToSlash(rel)
+		}
+		payload := map[string]interface{}{
+			"path":        path,
+			"event":       td.Event,
+			"detected_at": td.DetectedAt.UTC().Format(time.RFC3339Nano),
+		}
+		if err := emit(runID, src, "policy.tamper_detected", payload); err != nil {
+			fmt.Fprintf(os.Stderr, "centrol %s: warning: failed to log policy.tamper_detected event: %v\n", src, err)
+		}
+	}
+}
+
 func userConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {

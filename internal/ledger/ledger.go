@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -82,6 +83,36 @@ type Ledger struct {
 	lockPath      string
 	metaPath      string
 	rotateAtBytes int64
+
+	// ownWriteMu/ownWriteAt back isOwnWriteAt (tamper.go): the most
+	// recent instant this Ledger itself finished writing a line to a
+	// segment file, consulted by a live TamperWatcher so it can tell
+	// its own Append calls apart from an external modification to the
+	// same file. See ownWriteGrace in tamper.go for why this is a
+	// grace window rather than a start/stop flag.
+	ownWriteMu sync.Mutex
+	ownWriteAt time.Time
+}
+
+// markOwnWrite records that this Ledger itself just finished writing to
+// a segment file. Called once per successful write in appendRawBytes —
+// covering every Append, including rotation's own seal/rotate
+// housekeeping entries and a TamperWatcher's own policy.tamper_detected
+// write-back, since all of them funnel through that one function.
+func (l *Ledger) markOwnWrite() {
+	l.ownWriteMu.Lock()
+	l.ownWriteAt = time.Now()
+	l.ownWriteMu.Unlock()
+}
+
+// isOwnWriteAt reports whether t falls within ownWriteGrace of the most
+// recent markOwnWrite call — i.e., whether a filesystem event observed
+// at t could plausibly be this ledger's own write rather than an
+// external modification.
+func (l *Ledger) isOwnWriteAt(t time.Time) bool {
+	l.ownWriteMu.Lock()
+	defer l.ownWriteMu.Unlock()
+	return !l.ownWriteAt.IsZero() && t.Sub(l.ownWriteAt) < ownWriteGrace
 }
 
 // Open prepares a Ledger rooted at basePath (e.g. ".centrol/lighthouse.jsonl").
@@ -349,6 +380,14 @@ func (l *Ledger) appendRawBytes(segPath, run, src, typ string, payload json.RawM
 	if _, err := f.Write(line); err != nil {
 		return Entry{}, err
 	}
+	// Marked immediately after the write that actually produces the
+	// filesystem event a TamperWatcher observes — not before it, and not
+	// deferred past f.Close() — so the grace window it opens starts as
+	// close as possible to the moment fsnotify's underlying kernel
+	// mechanism (inotify/kqueue/ReadDirectoryChangesW) generates that
+	// event, rather than opening early and silently covering less of the
+	// real delivery delay than ownWriteGrace is sized for.
+	l.markOwnWrite()
 
 	return Entry{
 		V:       pre.V,

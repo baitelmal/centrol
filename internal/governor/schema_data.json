@@ -38,7 +38,7 @@
         "run.start", "run.end", "run.snapshot", "run.rollback",
         "fs.write", "fs.delete", "fs.create",
         "tool.call", "tool.result", "tool.blocked",
-        "policy.violation", "policy.silence", "policy.amend",
+        "policy.violation", "policy.silence", "policy.amend", "policy.tamper_detected",
         "contract.declare",
         "ledger.seal", "ledger.rotate",
         "verify.start", "verify.end", "verify.attempt",

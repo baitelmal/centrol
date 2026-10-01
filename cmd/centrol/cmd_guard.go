@@ -232,6 +232,15 @@ func cmdGuard(args []string) {
 	watcherDone := make(chan struct{})
 	go func() { watcher.Run(); close(watcherDone) }()
 
+	// Tamper detection is best-effort and never blocks the run: if the
+	// ledger directory somehow can't be watched (fsnotify exhaustion, an
+	// unusual filesystem), that's worth a warning, not a reason to abort
+	// a guard run that's otherwise fine.
+	tamperWatcher, tamperErr := g.WatchForTamper(tamperDetectionEmit(root, runID, "guard", emit))
+	if tamperErr != nil {
+		fmt.Fprintf(os.Stderr, "centrol guard: warning: tamper detection disabled: %v\n", tamperErr)
+	}
+
 	stopScope := make(chan struct{})
 	go pollScopeAmendments(centrolDir(root), runID, gc, emit, stopScope)
 
@@ -281,6 +290,9 @@ func cmdGuard(args []string) {
 	time.Sleep(400 * time.Millisecond)
 	_ = watcher.Close()
 	<-watcherDone
+	if tamperWatcher != nil {
+		_ = tamperWatcher.Close()
+	}
 
 	endPayload := map[string]interface{}{"exit_code": exitCode}
 	if runErr != nil {

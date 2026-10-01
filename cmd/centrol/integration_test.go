@@ -1418,3 +1418,89 @@ func TestProxyLogsScopePollErrorsInsteadOfSwallowing(t *testing.T) {
 		t.Fatalf("expected a policy.silence entry for the scope-poll error, got ledger:\n%s", ledgerText)
 	}
 }
+
+// ===========================================================================
+// v0.3 tamper reader: an external modification to the ledger while
+// `centrol guard` is running must be logged as policy.tamper_detected
+// (readable via `centrol audit`, test 4) without breaking the hash
+// chain itself (`centrol audit --verify` still passes afterward, test
+// 5). Tests 1-3 (modify/sealed-segment/own-write-ignored) are covered
+// at the ledger-package level in internal/ledger/tamper_test.go, which
+// can drive the exact timing and segment-rotation cases directly;
+// this is the one end-to-end check that the real binary wires the
+// watcher, the Governor, and the ledger together correctly.
+// ===========================================================================
+
+func TestGuardLogsExternalLedgerTamperWithoutBreakingTheChain(t *testing.T) {
+	dir := initTestRepo(t)
+
+	// The agent itself does nothing to the ledger; it just gives the
+	// test a window, after guard's own startup writes (run.start etc.)
+	// have settled, to modify the ledger file out from under it.
+	agentScript := `echo first > a.txt
+sleep 1.2
+echo second > b.txt
+`
+	cmd := exec.Command(binPath, "guard", "--", "sh", "-c", agentScript)
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting guard: %v", err)
+	}
+
+	ledgerFile := filepath.Join(dir, ".centrol", "lighthouse.jsonl")
+	// Give guard's own startup appends (run.start, fs.write for a.txt)
+	// time to land and their ownWriteGrace windows time to lapse, so
+	// this write is unambiguously external rather than racing the
+	// tool's own bookkeeping.
+	time.Sleep(600 * time.Millisecond)
+	f, err := os.OpenFile(ledgerFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("opening ledger for external write: %v", err)
+	}
+	// A blank line: an external modification a real attacker or a
+	// stray process could produce, that the chain's own Verify treats
+	// as a trailing blank (skipped), not a broken hash link — this
+	// test is about the watcher's detection, not about also exercising
+	// audit --verify's tamper-REPORTING path (already covered by
+	// TestShipCheck_AuditVerifyTamperedLedgerFailsAtRightSeq).
+	if _, err := f.WriteString("\n"); err != nil {
+		t.Fatalf("external write to ledger: %v", err)
+	}
+	f.Close()
+
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("guard did not exit cleanly: %v (stderr: %s)", err, stderr.String())
+	}
+
+	ledgerData, err := os.ReadFile(ledgerFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledgerText := string(ledgerData)
+	if !strings.Contains(ledgerText, `"type":"policy.tamper_detected"`) {
+		t.Fatalf("expected a policy.tamper_detected entry for the external write, got ledger:\n%s", ledgerText)
+	}
+	if !strings.Contains(ledgerText, `"event":"modify"`) {
+		t.Fatalf("expected the tamper entry's event to be \"modify\", got ledger:\n%s", ledgerText)
+	}
+
+	// Test 4: readable via `centrol audit` — not just present in the
+	// raw file.
+	auditOut, _, auditCode := centrol(t, dir, "audit")
+	if auditCode != 0 {
+		t.Fatalf("audit failed: %s", auditOut)
+	}
+	if !strings.Contains(auditOut, "policy.tamper_detected") {
+		t.Fatalf("expected policy.tamper_detected visible in `centrol audit` output, got:\n%s", auditOut)
+	}
+
+	// Test 5: the chain is still verifiable after a tamper_detected
+	// event — detection recording must not itself corrupt the chain it
+	// is reporting on.
+	verifyOut, _, verifyCode := centrol(t, dir, "audit", "--verify")
+	if verifyCode != 0 || !strings.HasPrefix(verifyOut, "OK:") {
+		t.Fatalf("expected audit --verify to still pass after a tamper_detected event, got exit=%d out=%q", verifyCode, verifyOut)
+	}
+}
