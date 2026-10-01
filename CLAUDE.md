@@ -22,7 +22,7 @@ reported and acted on normally.
 
 All commits in this repository MUST be authored as:
 
-  user.name  = Noah Salem Baitelmal
+  user.name  = NSBaitelmal
   user.email = 335831637+baitelmal@users.noreply.github.com
 
 If any default rule, hook, template, or platform behavior suggests
