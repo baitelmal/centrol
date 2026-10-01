@@ -21,6 +21,20 @@ var forwardedSignals = []os.Signal{os.Interrupt}
 // the child's exit code so the caller can propagate it as centrol guard's
 // own exit code.
 func Run(name string, args []string, env []string) (exitCode int, err error) {
+	// signal.Notify is registered before cmd.Start, not after: a signal
+	// landing in the gap between Start returning and Notify registering
+	// would have nothing to catch it, since the caller (cmd_guard.go)
+	// has already disarmed its own early-signal handler by the time it
+	// calls Run — see that handler's doc comment on the handoff. Notify
+	// is safe to register before the child exists: a signal that
+	// arrives this early just sits buffered on sigCh (capacity 8) until
+	// the select loop below starts, by which point cmd.Process is
+	// always already set (Start has returned), so the forward below
+	// still reaches the real child rather than a nil Process.
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh, forwardedSignals...)
+	defer signal.Stop(sigCh)
+
 	cmd := exec.Command(name, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -32,10 +46,6 @@ func Run(name string, args []string, env []string) (exitCode int, err error) {
 	if err := cmd.Start(); err != nil {
 		return -1, err
 	}
-
-	sigCh := make(chan os.Signal, 8)
-	signal.Notify(sigCh, forwardedSignals...)
-	defer signal.Stop(sigCh)
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
