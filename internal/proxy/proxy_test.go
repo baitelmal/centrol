@@ -1,13 +1,18 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/scirem/centrol/internal/policy"
+	"github.com/scirem/centrol/internal/proxy/transport"
 )
 
 func testContract() policy.Contract {
@@ -557,5 +562,74 @@ func TestOutOfScopeDenialSuggestionDoesNotMentionCentrolScope(t *testing.T) {
 	suggestion, _ := data["suggestion"].(string)
 	if strings.Contains(suggestion, "centrol scope") {
 		t.Fatalf("suggestion still tells the agent to run `centrol scope`, which has no effect on a running proxy: %q", suggestion)
+	}
+}
+
+// TestMalformedHTTPAndStdioResponsesTakeTheSameSilencePath is Pass 4
+// item 1's end-to-end parity check: an HTTP target's malformed body
+// and a stdio target's malformed line must be handled identically —
+// policy.silence, dropped, never forwarded — with no second policy
+// introduced for HTTP. It proves this by construction rather than by
+// assertion-matching two separate code paths: both a real HTTPTarget's
+// delivered frame and a hand-built "stdio line" are fed through the
+// exact same, single HandleTargetResponse call, directly (no
+// Governor, per Pass 4's test shape for this item) — there is only one
+// silence path in this package, and both transports reach it.
+func TestMalformedHTTPAndStdioResponsesTakeTheSameSilencePath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<<< not json, a misbehaving target's stray banner >>>"))
+	}))
+	defer srv.Close()
+
+	target := &transport.HTTPTarget{URL: srv.URL}
+	if err := target.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ch, err := target.Receive()
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`)) }()
+
+	var httpFrame []byte
+	select {
+	case httpFrame = <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the HTTP target's malformed frame")
+	}
+	if err := <-sendErr; err != nil {
+		t.Fatalf("expected Send to succeed — HTTPTarget does not validate bodies, see sendOnce's doc comment — got: %v", err)
+	}
+
+	// The stdio-side equivalent: a line a StdioTarget's own frame
+	// reader would hand to this exact function, no differently.
+	stdioLine := []byte("Server listening on stdio (a console.log leak)")
+
+	for _, tc := range []struct {
+		name string
+		line []byte
+	}{
+		{"http", httpFrame},
+		{"stdio", stdioLine},
+	} {
+		rec := &recorder{}
+		in := NewInterceptor("run-1", testContract(), rec.emit, nil, true)
+
+		forwardLine, err := in.HandleTargetResponse(tc.line)
+		if err != nil {
+			t.Fatalf("%s: HandleTargetResponse returned an error, expected silent drop: %v", tc.name, err)
+		}
+		if forwardLine != nil {
+			t.Fatalf("%s: expected the malformed line dropped (nil forwardLine), got: %q", tc.name, forwardLine)
+		}
+		if !rec.has("policy.silence") {
+			t.Fatalf("%s: expected policy.silence for the malformed frame, got %v", tc.name, rec.types)
+		}
+		if rec.entries[0]["reason"] != "unparseable target frame" {
+			t.Fatalf("%s: expected reason=\"unparseable target frame\", got %v", tc.name, rec.entries[0]["reason"])
+		}
 	}
 }

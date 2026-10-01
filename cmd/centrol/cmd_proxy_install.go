@@ -42,12 +42,33 @@ func clientConfigPath(client string) (string, error) {
 	}
 }
 
-// cmdProxyInstall patches a client's MCP config so its existing stdio
-// servers run through `centrol proxy --target ...` instead of directly.
-// Remote (url/serverUrl) servers are left untouched — this proxy only
-// fronts stdio targets. A timestamped backup of the original file is
-// always written first, and the patch is idempotent: re-running it
-// against an already-patched entry is a no-op for that entry.
+// remoteURL reports the remote server URL an entry declares, checking
+// both field names different MCP clients use for the same concept —
+// "url" and "serverUrl" — since there is no single standard key.
+// ok is false when neither field is present, or present but not a
+// non-empty string (e.g. a stdio entry with no url field at all).
+func remoteURL(entry map[string]interface{}) (string, bool) {
+	if u, ok := entry["url"].(string); ok && u != "" {
+		return u, true
+	}
+	if u, ok := entry["serverUrl"].(string); ok && u != "" {
+		return u, true
+	}
+	return "", false
+}
+
+// cmdProxyInstall patches a client's MCP config so its existing
+// servers run through centrol proxy instead of directly: a stdio
+// entry (command/args) through `centrol proxy --target ...`, a remote
+// entry (url or serverUrl — different clients use different field
+// names for the same thing) through `centrol proxy --target-url ...`
+// (Pass 4, item 4 — HTTP support used to stop here at a skip, back
+// when centrol proxy had no --target-url to wrap it through; see
+// remoteURL and its call site below). A timestamped backup of the
+// original file is always written first, and the patch is idempotent:
+// re-running it against an already-patched entry (stdio or remote
+// alike, both now indistinguishable from centrol's point of view —
+// see the "already wrapped" check below) is a no-op for that entry.
 func cmdProxyInstall(args []string) {
 	if len(args) == 0 {
 		fatalf("centrol proxy install: usage: centrol proxy install <claude-desktop|cursor|windsurf>")
@@ -93,22 +114,45 @@ func cmdProxyInstall(args []string) {
 		if !ok {
 			continue
 		}
-		if _, isRemote := entry["url"]; isRemote {
-			skipped++
-			continue
-		}
-		if _, isRemote := entry["serverUrl"]; isRemote {
-			skipped++
-			continue
-		}
+
+		// "Already wrapped" is checked first, and by command alone,
+		// so it catches both kinds of previously-wrapped entry the
+		// same way: a stdio entry's own command/args are gone once
+		// wrapped (replaced by centrol's), and a remote entry's url/
+		// serverUrl field is deleted once wrapped (below) — so on a
+		// second install run, a previously-wrapped remote entry looks
+		// exactly like a previously-wrapped stdio entry to this check,
+		// and both correctly fall through as a no-op.
 		command, _ := entry["command"].(string)
+		if command != "" && (command == selfPath || strings.HasSuffix(command, string(filepath.Separator)+"centrol") || command == "centrol") {
+			continue // already wrapped by a previous install run
+		}
+
+		if urlStr, ok := remoteURL(entry); ok {
+			// Pass 4, item 4: centrol proxy gained --target-url
+			// support, so a remote entry is wrapped exactly like a
+			// stdio one — same backup-then-rewrite pattern, same
+			// idempotency check above — instead of being skipped.
+			// url/serverUrl is deleted, not left alongside the new
+			// command/args: leaving it would make this entry look
+			// like both a stdio AND a remote server to the next
+			// client that reads it (and to the "already wrapped"
+			// check above, which must see a clean command-only entry
+			// on the next install run).
+			entry["command"] = selfPath
+			entry["args"] = []interface{}{"proxy", "--target-url", urlStr}
+			delete(entry, "url")
+			delete(entry, "serverUrl")
+			servers[name] = entry
+			wrapped++
+			continue
+		}
+
 		if command == "" {
 			skipped++
 			continue
 		}
-		if command == selfPath || strings.HasSuffix(command, string(filepath.Separator)+"centrol") || command == "centrol" {
-			continue // already wrapped by a previous install run
-		}
+
 		var argStrs []string
 		if rawArgs, ok := entry["args"].([]interface{}); ok {
 			for _, a := range rawArgs {

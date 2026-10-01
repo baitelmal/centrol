@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -485,6 +487,341 @@ func TestHTTPTargetReceiveAfterStopDoesNotHang(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("Receive after Stop hung — race not fixed")
+	}
+}
+
+// TestHTTPTargetForwardsNonJSONBodyUnvalidated proves HTTPTarget itself
+// does no JSON validation of a response body before delivering it —
+// Pass 4 item 1 ("do not introduce a second policy for HTTP"). The
+// body here is garbage, Content-Type says application/json anyway (a
+// misbehaving target is exactly the realistic case), and deliver still
+// forwards it byte-for-byte: recognizing and dropping it is
+// Interceptor.HandleTargetResponse's job (proxy.policy.silence), the
+// same single code path a malformed stdio line goes through — see
+// TestMalformedHTTPAndStdioResponsesTakeTheSameSilencePath in
+// internal/proxy/proxy_test.go for that shared-path proof.
+func TestHTTPTargetForwardsNonJSONBodyUnvalidated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "this is not json at all")
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`)) }()
+
+	frame := drainOne(t, ch)
+	if err := <-sendErr; err != nil {
+		t.Fatalf("expected Send to succeed (delivery, not validation, is HTTPTarget's job), got: %v", err)
+	}
+	if string(frame) != "this is not json at all" {
+		t.Fatalf("expected the malformed body forwarded verbatim, got: %q", frame)
+	}
+}
+
+// TestHTTPTargetForwardsMalformedSSEDataLineUnvalidated is the SSE
+// counterpart to TestHTTPTargetForwardsNonJSONBodyUnvalidated: a
+// "data:" line that isn't valid JSON is still forwarded as its own
+// frame, unvalidated — same reasoning, same downstream policy.silence
+// handling.
+func TestHTTPTargetForwardsMalformedSSEDataLineUnvalidated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("httptest ResponseWriter does not support flushing")
+		}
+		_, _ = io.WriteString(w, "data: {not valid json\n\n")
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`)) }()
+
+	frame := drainOne(t, ch)
+	if err := <-sendErr; err != nil {
+		t.Fatalf("expected Send to succeed, got: %v", err)
+	}
+	if string(frame) != "{not valid json" {
+		t.Fatalf("expected the malformed data: line forwarded verbatim, got: %q", frame)
+	}
+}
+
+// TestHTTPTargetSessionRevocationOn401SurfacesStructuredErrorAndClearsSession
+// is Pass 4 item 2's middle case: a 401 on a request that carried a
+// session id means the target revoked that session, not an ordinary
+// auth failure (see sendOnce's doc comment). Send must return nil (the
+// whole run must not die over one call's session), a structured
+// JSON-RPC error addressed to that call's own id must appear on the
+// receive channel instead, and the dead session id must be cleared so
+// the next request goes out fresh.
+func TestHTTPTargetSessionRevocationOn401SurfacesStructuredErrorAndClearsSession(t *testing.T) {
+	var requestCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.Header().Set("Mcp-Session-Id", "sess-doomed")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+			return
+		}
+		if got := r.Header.Get("Mcp-Session-Id"); got != "sess-doomed" {
+			t.Errorf("expected the revoked call to still carry the session id it was sent with, got %q", got)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("session expired"))
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	go func() { _ = target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`)) }()
+	drainOne(t, ch) // first call's real response; establishes the session
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- target.Send([]byte(`{"jsonrpc":"2.0","id":"2","method":"b"}`)) }()
+
+	frame := drainOne(t, ch)
+	if err := <-sendErr; err != nil {
+		t.Fatalf("expected a session revocation to be absorbed, not returned as an error (it would end the whole run), got: %v", err)
+	}
+
+	var env map[string]interface{}
+	if err := json.Unmarshal(frame, &env); err != nil {
+		t.Fatalf("expected a well-formed JSON-RPC error frame, got %q: %v", frame, err)
+	}
+	if env["id"] != "2" {
+		t.Fatalf("expected the synthetic error addressed to id=2 (the call that hit it), got %v", env["id"])
+	}
+	errObj, ok := env["error"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected an \"error\" object (a structured error, not silence), got: %s", frame)
+	}
+	data, ok := errObj["data"].(map[string]interface{})
+	if !ok || data["reason"] != "session_revoked" {
+		t.Fatalf(`expected error.data.reason == "session_revoked", got: %s`, frame)
+	}
+
+	if target.SessionID != "" {
+		t.Fatalf("expected the revoked session id to be cleared, got %q", target.SessionID)
+	}
+}
+
+// TestHTTPTargetSessionRevocationOn403 confirms the same handling
+// applies to 403, not just 401 — the Streamable HTTP transport doesn't
+// pin session revocation to one specific status code.
+func TestHTTPTargetSessionRevocationOn403(t *testing.T) {
+	var requestCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.Header().Set("Mcp-Session-Id", "sess-doomed-403")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	go func() { _ = target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`)) }()
+	drainOne(t, ch)
+
+	sendErr := make(chan error, 1)
+	go func() { sendErr <- target.Send([]byte(`{"jsonrpc":"2.0","id":"2","method":"b"}`)) }()
+
+	frame := drainOne(t, ch)
+	if err := <-sendErr; err != nil {
+		t.Fatalf("expected a 403 session revocation to be absorbed, got: %v", err)
+	}
+	var env map[string]interface{}
+	if err := json.Unmarshal(frame, &env); err != nil {
+		t.Fatalf("expected a well-formed JSON-RPC error frame, got %q: %v", frame, err)
+	}
+	if env["id"] != "2" {
+		t.Fatalf("expected the synthetic error addressed to id=2, got %v", env["id"])
+	}
+	if target.SessionID != "" {
+		t.Fatalf("expected the revoked session id to be cleared, got %q", target.SessionID)
+	}
+}
+
+// TestHTTPTarget401WithoutASessionIsAnOrdinaryError is the negative
+// control: a 401 that never had a session id attached is an ordinary
+// auth failure the operator needs to fix, not a revocation to recover
+// from — it must surface as the usual HTTPStatusError (ending the run,
+// same as any other unrecoverable transport failure), not be absorbed
+// as a per-call recoverable error.
+func TestHTTPTarget401WithoutASessionIsAnOrdinaryError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("who are you"))
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	err := target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`))
+	if err == nil {
+		t.Fatal("expected a 401 with no prior session to surface as an ordinary error")
+	}
+	var statusErr *HTTPStatusError
+	if !asHTTPStatusError(err, &statusErr) {
+		t.Fatalf("expected a plain *HTTPStatusError, got %T: %v", err, err)
+	}
+	if statusErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected StatusCode=401, got %d", statusErr.StatusCode)
+	}
+
+	select {
+	case frame := <-ch:
+		t.Fatalf("expected no synthetic frame delivered for an ordinary auth failure, got: %s", frame)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestHTTPTargetSessionRevocationOnNotificationClearsSessionButDeliversNoFrame
+// covers the JSON-RPC edge case: a notification (no id) has nothing a
+// client could correlate a response to, so even though its session was
+// just revoked, nothing is delivered on the receive channel — but the
+// session is still cleared so the next real call starts fresh.
+func TestHTTPTargetSessionRevocationOnNotificationClearsSessionButDeliversNoFrame(t *testing.T) {
+	var requestCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.Header().Set("Mcp-Session-Id", "sess-doomed-notif")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	go func() { _ = target.Send([]byte(`{"jsonrpc":"2.0","id":"1","method":"a"}`)) }()
+	drainOne(t, ch)
+
+	// A notification: no "id" field at all.
+	if err := target.Send([]byte(`{"jsonrpc":"2.0","method":"notifications/progress"}`)); err != nil {
+		t.Fatalf("expected the revocation to be absorbed even for a notification, got: %v", err)
+	}
+
+	select {
+	case frame := <-ch:
+		t.Fatalf("expected no frame delivered for a notification's revoked session, got: %s", frame)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if target.SessionID != "" {
+		t.Fatalf("expected the session id to be cleared even though nothing was delivered, got %q", target.SessionID)
+	}
+}
+
+// TestHTTPTargetConcurrentSendsCorrelateResponsesByID is Pass 4 item 3:
+// HTTPTarget.Send must be safe to call from multiple goroutines at
+// once, and each response must be delivered correlated to its own
+// call's id — never mixed up, never dropped — regardless of which
+// call's HTTP round trip happens to finish first. This is a safety net
+// for future pipelining work (the client->target pump is currently
+// serial by construction — see internal/governor/run.go — so no real
+// run exercises this today), not a test of current end-to-end
+// behavior.
+//
+// The server deliberately answers the first (slow) call's request
+// only after the second (fast) call has already been sent and
+// answered, so a correlation bug (e.g. a shared buffer reused across
+// concurrent sendOnce calls) would show up as the wrong body paired
+// with the wrong id.
+func TestHTTPTargetConcurrentSendsCorrelateResponsesByID(t *testing.T) {
+	const slowID, fastID = "slow-1", "fast-2"
+	fastArrived := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&env)
+		id, _ := env["id"].(string)
+
+		if id == slowID {
+			// Hold the slow call's response until the fast call has
+			// been sent and answered, so their completions interleave
+			// in the order the test is named for.
+			select {
+			case <-fastArrived:
+			case <-time.After(2 * time.Second):
+			}
+		} else {
+			defer close(fastArrived)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0", "id": id, "result": map[string]interface{}{"echo": id},
+		})
+		_, _ = w.Write(resp)
+	}))
+	defer srv.Close()
+
+	target := &HTTPTarget{URL: srv.URL}
+	_ = target.Start(context.Background())
+	ch, _ := target.Receive()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := target.Send([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":"%s","method":"slow"}`, slowID))); err != nil {
+			t.Errorf("slow Send: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := target.Send([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":"%s","method":"fast"}`, fastID))); err != nil {
+			t.Errorf("fast Send: %v", err)
+		}
+	}()
+
+	seen := map[string]string{} // id -> echoed id, from each frame's own result.echo
+	for i := 0; i < 2; i++ {
+		frame := drainOne(t, ch)
+		var env map[string]interface{}
+		if err := json.Unmarshal(frame, &env); err != nil {
+			t.Fatalf("frame %d is not valid JSON: %v (%s)", i, err, frame)
+		}
+		id, _ := env["id"].(string)
+		result, _ := env["result"].(map[string]interface{})
+		echo, _ := result["echo"].(string)
+		if id != echo {
+			t.Fatalf("frame correlation broke: id=%q but result.echo=%q — a response was delivered under the wrong id", id, echo)
+		}
+		seen[id] = echo
+	}
+	wg.Wait()
+
+	if len(seen) != 2 || seen[slowID] != slowID || seen[fastID] != fastID {
+		t.Fatalf("expected both %q and %q delivered once each, correctly correlated, got: %v", slowID, fastID, seen)
 	}
 }
 

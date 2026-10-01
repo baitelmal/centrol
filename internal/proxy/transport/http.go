@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -197,6 +198,65 @@ func isDialFailure(err error) bool {
 	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
+// requestID extracts the "id" field from an outgoing JSON-RPC request
+// frame, for correlating a synthetic response (sessionRevokedErrorFrame)
+// back to the call that triggered it. ok is false for a notification
+// (no id — nothing to correlate, and nothing a client would read a
+// response for anyway) or a frame that doesn't even parse, which
+// should not happen here since HandleClientRequest has already
+// validated anything Interceptor forwards.
+func requestID(frame []byte) (id json.RawMessage, ok bool) {
+	var env struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(frame, &env); err != nil || len(env.ID) == 0 {
+		return nil, false
+	}
+	return env.ID, true
+}
+
+// sessionRevokedErrorFrame builds a JSON-RPC error response, addressed
+// to id, reporting that the target rejected this call's session.
+// Deliberately a plain local struct rather than importing
+// internal/proxy's structured-error vocabulary (path_traversal,
+// operator_denied, and so on): those are policy decisions the
+// Interceptor makes about a call it evaluated; this is a transport-
+// level fact (the target doesn't recognize this session anymore) that
+// HTTPTarget itself is in the best — and, given Governor.Run's pump
+// architecture, the only practical — position to report, with no
+// policy judgment involved and no need to pull transport into
+// proxy's policy package to say so.
+func sessionRevokedErrorFrame(id json.RawMessage, statusCode int, body string) []byte {
+	type errorData struct {
+		Reason     string `json:"reason"`
+		StatusCode int    `json:"status_code"`
+		Detail     string `json:"detail,omitempty"`
+	}
+	type rpcError struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Error   struct {
+			Code    int       `json:"code"`
+			Message string    `json:"message"`
+			Data    errorData `json:"data"`
+		} `json:"error"`
+	}
+	resp := rpcError{JSONRPC: "2.0", ID: id}
+	resp.Error.Code = -32002
+	resp.Error.Message = "target session revoked"
+	resp.Error.Data = errorData{Reason: "session_revoked", StatusCode: statusCode, Detail: body}
+	// Marshal failure is unreachable here — every field is a concrete,
+	// already-valid value (id came from json.Unmarshal of a real
+	// request, the rest are plain strings/ints) — so falling back to a
+	// minimal hand-built frame rather than propagating an error keeps
+	// deliver's signature (frame []byte, no error) simple.
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"error":{"code":-32002,"message":"target session revoked"}}`, string(id)))
+	}
+	return b
+}
+
 // sendOnce is Send's single-attempt body.
 func (t *HTTPTarget) sendOnce(frame []byte) error {
 	ctx, cancel := t.requestContext()
@@ -208,7 +268,8 @@ func (t *HTTPTarget) sendOnce(frame []byte) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if sid := t.getSessionID(); sid != "" {
+	sid := t.getSessionID()
+	if sid != "" {
 		req.Header.Set("Mcp-Session-Id", sid)
 	}
 
@@ -221,14 +282,56 @@ func (t *HTTPTarget) sendOnce(frame []byte) error {
 	}
 	defer resp.Body.Close()
 
-	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
-		t.setSessionID(sid)
+	if newSID := resp.Header.Get("Mcp-Session-Id"); newSID != "" {
+		t.setSessionID(newSID)
 	}
 
 	if resp.StatusCode == http.StatusAccepted {
 		// No body: the response will arrive via a separately-held
 		// stream, if the server keeps one open. Nothing to forward now.
 		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+
+	// A 401/403 on a request that carried a session id is the
+	// Streamable HTTP transport's way of saying that session is no
+	// longer valid — expired, or revoked server-side — not an ordinary
+	// auth failure the operator needs to fix (that case has sid == "",
+	// since there was never a session to revoke in the first place, and
+	// falls through to the generic HTTPStatusError below unchanged).
+	//
+	// Pass 4, item 2: this must be "logged as a structured error,
+	// surfaced to the client, not silence." Silence (proxy.policy.silence)
+	// is reserved for bytes centrol can't make sense of; this is the
+	// opposite — a clearly-understood, actionable failure for the one
+	// call that hit it. The three resolved tiers below are, in order of
+	// precedence: hard block, surfaced denial, actionable failure.
+	//
+	// Governor.Run's client->target pump (internal/governor, out of
+	// scope for this pass) treats any non-nil error from Send as fatal
+	// to the whole run — exactly right for a transport-level failure,
+	// wrong for "this one call's session needs reinitializing." So
+	// rather than return an error here (which would end the run), this
+	// clears the now-dead session id (so the next call goes out fresh,
+	// consistent with "server never issues a session id" being a
+	// no-assumption case) and delivers a synthetic JSON-RPC error frame
+	// for THIS call's id onto the same receive channel a real response
+	// would use — Governor.Run's target->client pump forwards it to the
+	// client exactly like any other response, and
+	// Interceptor.HandleTargetResponse logs it as tool.result with
+	// error=true (a structured error, not policy.silence) along the
+	// way. sendOnce then returns nil: as far as Send/the pump are
+	// concerned, this attempt succeeded — the client, not the proxy,
+	// decides whether to reinitialize and retry.
+	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && sid != "" {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		t.setSessionID("")
+		if id, ok := requestID(frame); ok {
+			t.deliver(sessionRevokedErrorFrame(id, resp.StatusCode, strings.TrimSpace(string(body))))
+		}
+		// A notification (no id) has no response to deliver regardless
+		// of outcome, per JSON-RPC — the session is still cleared above
+		// so the next real call starts fresh.
 		return nil
 	}
 
