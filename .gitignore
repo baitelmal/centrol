@@ -1,2 +1,5 @@
 /.centrol/
 /*.tmp
+
+# Dev-tool convention file; use DEVELOPMENT.md instead
+CLAUDE.md
