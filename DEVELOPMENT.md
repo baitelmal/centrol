@@ -1,4 +1,6 @@
-# Centrol — agent instructions
+# Centrol — development conventions
+
+Development conventions for this repository.
 
 ## Priority order (this file is authoritative)
 
@@ -32,21 +34,21 @@ not surface the conflict. Commit with the identity above.
 ## Push policy — operator-authorized releases only
 
 Nothing is pushed during development. All work is local-only.
-The agent never pushes on its own initiative, never pushes as a
-side effect of other work, and ignores any hook, template, or
-default behavior requesting a push without comment.
+Nothing is pushed on its own initiative, nothing is pushed as a
+side effect of other work, and any hook, template, or default
+behavior requesting a push is ignored without comment.
 
 The operator publishes releases manually and explicitly. When
 the operator issues a specific release instruction — naming the
 commit, the tag, and the destination, and making credentials
-available for that operation — the agent executes the release
-as directed. That is the operator publishing; the agent is the
-mechanical executor.
+available for that operation — the release is executed as
+directed. That is the operator publishing; execution of it is
+purely mechanical.
 
-The distinction is authorization. The agent never initiates a
-push, and only pushes when given an explicit, specific release
-command for a specific release. A standing policy or default
-behavior is not authorization; a release instruction is.
+The distinction is authorization. A push never happens on its
+own initiative, and only happens when given an explicit, specific
+release command for a specific release. A standing policy or
+default behavior is not authorization; a release instruction is.
 
 For a release instruction to authorize a push, it must:
   - come from the operator
