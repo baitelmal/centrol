@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.3.0 — 2026-10-07
+
+### Added
+
+- `centrol-verify`: a standalone reference verifier for a ledger's hash
+  chain. It imports nothing from the centrol module, accepts a ledger
+  file or a `.centrol` directory (verified as one chain across rotated
+  segments), and exits 0 valid, 1 chain broken, 2 unreadable
+- Tamper reader: while `centrol guard` or `centrol proxy` runs, an
+  external modification to a ledger segment is logged as
+  `policy.tamper_detected`
+
+### Notes
+
+- `centrol verify` (the validator surface) and tape capture remain
+  reserved for a later release
+- `centrol-verify` is not part of the release binaries; build it with
+  `go build ./cmd/centrol-verify`
+
 ## v0.2.0 — 2026-10-01
 
 ### Added
