@@ -307,6 +307,13 @@ func cmdProxyRun(args []string) {
 
 	_ = emit(runID, "proxy", "run.start", map[string]interface{}{"target": targetDesc})
 
+	// Tamper detection is best-effort and never blocks the run: see the
+	// matching comment in cmd_guard.go.
+	tamperWatcher, tamperErr := g.WatchForTamper(tamperDetectionEmit(root, runID, "proxy", emit))
+	if tamperErr != nil {
+		fmt.Fprintf(os.Stderr, "centrol proxy: warning: tamper detection disabled: %v\n", tamperErr)
+	}
+
 	stopScope := make(chan struct{})
 	go func() {
 		var offset int64
@@ -504,6 +511,9 @@ func cmdProxyRun(args []string) {
 		runErr = g.Run(context.Background(), transport.NewStdioTarget(fields[0], fields[1:], os.Stderr), interceptor, os.Stdin, os.Stdout, os.Stderr)
 	}
 	close(stopScope)
+	if tamperWatcher != nil {
+		_ = tamperWatcher.Close()
+	}
 
 	// Audit fix (4a): g.Cause()/g.ExitCode() are the Governor's own
 	// record of what actually happened during Run — including a

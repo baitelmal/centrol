@@ -89,6 +89,19 @@ never forwarded — the caller gets a structured denial instead (see
 path is never touched, that guarantee exists on the proxy path, not the
 guard path.
 
+## Detection and verification
+
+Centrol's ledger is hash-chained and verifiable by anyone using
+`centrol-verify` (a standalone binary that does not depend on Centrol).
+While the tool is running, any external modification to `.centrol/`
+ledger files is detected and logged as a `policy.tamper_detected`
+event.
+
+Limit: detection works while the tool is running. The free tier does
+not prevent offline modification of a sealed segment. Full
+tamper-resistance — including off-machine anchoring and managed
+verification — is available in the enterprise tier.
+
 ## Honest scope of `centrol undo`
 
 - Restores tracked git state (via the snapshot taken before the run) plus

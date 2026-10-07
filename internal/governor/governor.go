@@ -171,3 +171,14 @@ func (g *Governor) Verify() (ledger.VerifyResult, error) {
 func (g *Governor) Resume() (hash string, seq int, hasChain bool, err error) {
 	return g.ledger.LastHashSeq()
 }
+
+// WatchForTamper exposes the ledger's own tamper detection to callers
+// that own a run (cmd/centrol's guard and proxy wiring). Like
+// Tail/Verify/Resume, this is a pure passthrough — converting a
+// TamperDetection into a policy.tamper_detected entry (repo-relative
+// path, emit, error handling) is the caller's job, exactly as building
+// fs.write/fs.create/fs.delete entries from guard.Watcher's raw events
+// is, not something Governor does on the ledger's behalf.
+func (g *Governor) WatchForTamper(onTamper func(ledger.TamperDetection)) (*ledger.TamperWatcher, error) {
+	return g.ledger.WatchForTamper(onTamper)
+}
