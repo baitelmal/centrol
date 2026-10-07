@@ -37,6 +37,12 @@ your platform and installs it to `/usr/local/bin` (override with
 curl -fsSL https://raw.githubusercontent.com/baitelmal/centrol/main/install-centrol.sh | sh
 ```
 
+The canonical repository, and the only install path, is
+`github.com/baitelmal/centrol`: releases, checksums and the install
+script all live there. The Go module is declared as
+`github.com/scirem/centrol`; that is an import path used inside the
+source tree and has no effect on installing.
+
 ## Quickstart
 
 ```sh
