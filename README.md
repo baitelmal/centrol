@@ -102,6 +102,47 @@ not prevent offline modification of a sealed segment. Full
 tamper-resistance — including off-machine anchoring and managed
 verification — is available in the enterprise tier.
 
+## Reference verifier: `centrol-verify`
+
+`centrol-verify` is a standalone program that checks a ledger's hash
+chain. It imports nothing from the centrol module — not the ledger
+package, not the governor — so it re-derives the hashing rule from
+`schemas/event.v1.json` rather than trusting the code that wrote the
+ledger. The point is that you can check a ledger without trusting, or
+even building, the binary that produced it: two independent
+implementations agreeing is stronger than one checking itself.
+
+It accepts a ledger from any tier. Every Centrol tier writes the same
+event envelope and chain, so a free-tier ledger, an enterprise station
+ledger and an enterprise org ledger all verify the same way.
+
+```
+centrol-verify <path-to-lighthouse.jsonl>
+centrol-verify <path-to-.centrol-directory>
+```
+
+A file is verified as one segment. A directory is verified as one
+continuous chain across a ledger's rotated segments. Exit codes: `0`
+valid, `1` chain broken (it reports the first failing sequence number
+and why), `2` could not read the input. It is built from this
+repository:
+
+```sh
+go build -o centrol-verify ./cmd/centrol-verify
+```
+
+Limit: it proves the entries it is given are internally consistent
+(every hash matches, sequence numbers are contiguous, each entry links
+to the one before). It cannot tell that entries were removed from the
+start or end of a ledger. Catching that needs a copy of the ledger held
+somewhere the producer cannot reach, which is what the enterprise tier's
+off-machine archive is for.
+
+**Tamper reader.** While `centrol guard` or `centrol proxy` is running,
+an external write to a ledger segment (content or permissions) is
+logged as a `policy.tamper_detected` event, so tampering during a run
+is itself in the record.
+
 ## Honest scope of `centrol undo`
 
 - Restores tracked git state (via the snapshot taken before the run) plus
@@ -384,7 +425,9 @@ just confirmed is untampered.
   subprocess/filesystem/network surfaces, `proxy install` wraps remote
   servers too, broader test coverage
 - **v0.2.x** — continued hardening on the v0.2 surfaces
-- **v0.3** — verify, a validator surface: attempt → test → invariant
+- **v0.3.0** — shipped: the reference verifier (`centrol-verify`) and the
+  tamper reader
+- **v0.3** — still to come: verify, a validator surface: attempt → test → invariant
   check → packet → approve/reject, gated the same way guard and proxy
   are today; tape capture (full-fidelity call/response recording) also
   lands here
