@@ -11,6 +11,8 @@
 - Tamper reader: while `centrol guard` or `centrol proxy` runs, an
   external modification to a ledger segment is logged as
   `policy.tamper_detected`
+- `centrol-verify` now ships as a release binary (previously
+  build-from-source)
 
 ### Changed
 
@@ -24,8 +26,6 @@
 
 - `centrol verify` (the validator surface) and tape capture remain
   reserved for a later release
-- `centrol-verify` is not part of the release binaries; build it with
-  `go build ./cmd/centrol-verify`
 
 ## v0.2.0 — 2026-10-01
 
