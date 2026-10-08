@@ -125,6 +125,7 @@ ledger and an enterprise org ledger all verify the same way.
 ```
 centrol-verify <path-to-lighthouse.jsonl>
 centrol-verify <path-to-.centrol-directory>
+centrol-verify --first-seq N <path>
 ```
 
 A file is verified as one segment. A directory is verified as one
@@ -137,12 +138,19 @@ repository:
 go build -o centrol-verify ./cmd/centrol-verify
 ```
 
+The first entry must be seq 1 with an empty prev, so a ledger whose
+oldest entries or leading segments were deleted fails even though every
+remaining link is intact. A slice of a longer chain, such as one
+archived batch from the enterprise tier, is checked with `--first-seq N`
+(its manifest names `first_seq`); the first entry must then be seq `N`.
+
 Limit: it proves the entries it is given are internally consistent
 (every hash matches, sequence numbers are contiguous, each entry links
-to the one before). It cannot tell that entries were removed from the
-start or end of a ledger. Catching that needs a copy of the ledger held
-somewhere the producer cannot reach, which is what the enterprise tier's
-off-machine archive is for.
+to the one before, the chain starts where it should). It cannot tell
+that entries were removed from the end of a ledger. Catching that needs
+a copy of the ledger's head held somewhere the producer cannot reach,
+which is what the enterprise tier's off-machine archive and signed seal
+envelopes are for.
 
 **Tamper reader.** While `centrol guard` or `centrol proxy` is running,
 an external write to a ledger segment (content or permissions) is

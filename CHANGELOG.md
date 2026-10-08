@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `centrol audit --verify` and `centrol-verify` now require the first
+  entry to be seq 1 with an empty prev. A ledger with its oldest entries
+  or leading segments deleted used to verify clean; it now fails.
+  `centrol-verify --first-seq N` verifies a slice of a longer chain
+
 ## v0.3.0 — 2026-10-07
 
 ### Added

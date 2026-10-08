@@ -271,3 +271,43 @@ func TestUsageErrorExitsTwo(t *testing.T) {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
 }
+
+// A chain with its oldest entries deleted has every remaining link
+// intact. It must still fail: the first entry is not seq 1.
+func TestDeletedHeadFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lighthouse.jsonl")
+	buildValidLedger(t, path, 5)
+	raw, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if err := os.WriteFile(path, []byte(strings.Join(lines[2:], "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, _ := runCLI(t, path)
+	if code != 1 || !strings.Contains(stdout, "FAIL at seq 3: chain does not start at seq 1") {
+		t.Fatalf("code=%d stdout=%q, want exit 1 with a does-not-start-at-seq-1 failure", code, stdout)
+	}
+}
+
+// A slice of a longer chain (an archived batch) verifies with
+// --first-seq naming its first seq, and only with that value.
+func TestFirstSeqVerifiesASlice(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lighthouse.jsonl")
+	buildValidLedger(t, path, 5)
+	raw, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if err := os.WriteFile(path, []byte(strings.Join(lines[2:], "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for first, want := range map[string]int{"3": 0, "2": 1, "1": 1, "4": 1} {
+		var out, errb bytes.Buffer
+		if code := run([]string{"--first-seq", first, path}, &out, &errb); code != want {
+			t.Errorf("--first-seq %s: exit %d, want %d (%s)", first, code, want, out.String())
+		}
+	}
+	var out, errb bytes.Buffer
+	if code := run([]string{"--first-seq", "0", path}, &out, &errb); code != 2 {
+		t.Errorf("--first-seq 0: exit %d, want 2", code)
+	}
+}

@@ -41,6 +41,15 @@
 //
 //	centrol-verify <path-to-lighthouse.jsonl>
 //	centrol-verify <path-to-.centrol-directory>
+//	centrol-verify --first-seq N <path>
+//
+// The first entry must be seq 1 with an empty prev, so a ledger with its
+// oldest entries or leading segments deleted fails even though every
+// remaining link is intact. A slice of a longer chain (one archived
+// batch, whose MANIFEST.json names its first_seq) is verified with
+// --first-seq set to that value; the first entry's seq must then equal N,
+// and its prev is checked only when N is 1. What a hash chain alone can
+// never show is a missing tail: that needs a record held elsewhere.
 //
 // A single file is verified as one segment. A directory is scanned for a
 // ledger's segments (a base file plus any <name>.NNN<ext> rotations) and
@@ -240,7 +249,7 @@ type result struct {
 // A non-nil error return means a segment file itself couldn't be read
 // (missing, permission denied, I/O failure) — distinct from the chain
 // being invalid, which is reported in the returned result instead.
-func verify(segs []string) (result, error) {
+func verify(segs []string, firstSeq int) (result, error) {
 	res := result{ok: true, segCount: len(segs)}
 
 	var prevHash string
@@ -288,6 +297,14 @@ func verify(segs []string) (result, error) {
 				res.failEntries = entriesFor(nil, raw)
 				return res, nil
 			}
+			if first && (e.Seq != firstSeq || (firstSeq == 1 && e.Prev != "")) {
+				f.Close()
+				res.ok = false
+				res.failSeq, res.hasFailSeq = e.Seq, true
+				res.failReason = fmt.Sprintf("chain does not start at seq %d with the expected prev: first entry is seq %d (earlier entries or segments were removed)", firstSeq, e.Seq)
+				res.failEntries = entriesFor(nil, raw)
+				return res, nil
+			}
 			if !first && e.Seq != prevSeq+1 {
 				f.Close()
 				res.ok = false
@@ -329,8 +346,18 @@ func entriesFor(prev, cur []byte) [][]byte {
 // run implements the CLI and returns the process exit code, so the
 // tests below can exercise it directly without spawning a subprocess.
 func run(args []string, stdout, stderr io.Writer) int {
+	const usage = "usage: centrol-verify [--first-seq N] <path-to-lighthouse.jsonl-or-segment-directory>"
+	firstSeq := 1
+	if len(args) == 3 && args[0] == "--first-seq" {
+		n, err := strconv.Atoi(args[1])
+		if err != nil || n < 1 {
+			fmt.Fprintln(stderr, usage)
+			return 2
+		}
+		firstSeq, args = n, args[2:]
+	}
 	if len(args) != 1 {
-		fmt.Fprintln(stderr, "usage: centrol-verify <path-to-lighthouse.jsonl-or-segment-directory>")
+		fmt.Fprintln(stderr, usage)
 		return 2
 	}
 
@@ -340,7 +367,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	res, err := verify(segs)
+	res, err := verify(segs, firstSeq)
 	if err != nil {
 		fmt.Fprintf(stderr, "centrol-verify: %v\n", err)
 		return 2

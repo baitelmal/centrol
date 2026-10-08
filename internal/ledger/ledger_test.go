@@ -462,3 +462,29 @@ func writeLines(t *testing.T, path string, lines []string) {
 		}
 	}
 }
+
+// A chain with its oldest entries removed keeps every remaining link
+// intact; Verify must still reject it because it does not start at
+// seq 1.
+func TestVerifyRejectsChainWithHeadRemoved(t *testing.T) {
+	l := newTestLedger(t)
+	for i := 0; i < 4; i++ {
+		mustAppend(t, l, "run-1", "guard", "fs.write", map[string]interface{}{"i": i})
+	}
+	path := filepath.Join(l.dir, "lighthouse.jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.SplitAfter(string(raw), "\n")
+	if err := os.WriteFile(path, []byte(strings.Join(lines[1:], "")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := l.Verify()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OK || res.FailedAt == nil || res.FailedAt.Seq != 2 || !strings.Contains(res.FailedAt.Reason, "does not start at seq 1") {
+		t.Fatalf("Verify = %+v (%+v), want a failure at seq 2: chain does not start at seq 1", res, res.FailedAt)
+	}
+}

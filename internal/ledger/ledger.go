@@ -458,8 +458,10 @@ type FailedEntry struct {
 	Reason  string
 }
 
-// Verify walks every segment in order and checks: each entry's stored
-// hash matches its recomputed hash, seq increments by exactly 1 across
+// Verify walks every segment in order and checks: the first entry is
+// seq 1 with an empty prev (so deleting the oldest entries or segments
+// is detected, not just a break between two entries that remain), each
+// entry's stored hash matches its recomputed hash, seq increments by exactly 1 across
 // the whole chain, and each entry's prev matches the previous entry's
 // hash (including across segment boundaries, via ledger.rotate entries).
 func (l *Ledger) Verify() (VerifyResult, error) {
@@ -504,6 +506,12 @@ func (l *Ledger) Verify() (VerifyResult, error) {
 				f.Close()
 				res.OK = false
 				res.FailedAt = &FailedEntry{Segment: filepath.Base(segPath), Seq: e.Seq, Reason: "hash mismatch (entry was tampered with)"}
+				return res, nil
+			}
+			if first && (e.Seq != 1 || e.Prev != "") {
+				f.Close()
+				res.OK = false
+				res.FailedAt = &FailedEntry{Segment: filepath.Base(segPath), Seq: e.Seq, Reason: fmt.Sprintf("chain does not start at seq 1 with an empty prev: first entry is seq %d (earlier entries or segments were removed)", e.Seq)}
 				return res, nil
 			}
 			if !first && e.Seq != prevSeq+1 {
