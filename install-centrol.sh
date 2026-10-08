@@ -1,7 +1,10 @@
 #!/bin/sh
-# install-centrol.sh — installs the centrol CLI to /usr/local/bin (or
-# $CENTROL_INSTALL_DIR if set). No telemetry, no account, no network
-# access beyond fetching this release's binary and its SHA256SUMS file.
+# install-centrol.sh — installs the centrol CLI and the centrol-verify
+# reference verifier to /usr/local/bin (or $CENTROL_INSTALL_DIR if set).
+# No telemetry, no account, no network access beyond fetching this
+# release's binaries and its SHA256SUMS file. Both binaries are checked
+# against SHA256SUMS before either is installed. sudo is used only for
+# the final move, and only when the install directory is not writable.
 set -eu
 
 REPO="baitelmal/centrol"
@@ -50,48 +53,61 @@ sha256_of() {
   fi
 }
 
+# install_one TMP_FILE NAME — moves a verified binary into INSTALL_DIR.
+install_one() {
+  if [ -w "$INSTALL_DIR" ]; then
+    mv "$1" "$INSTALL_DIR/$2"
+  else
+    echo "centrol: installing to $INSTALL_DIR requires sudo" >&2
+    sudo mv "$1" "$INSTALL_DIR/$2"
+  fi
+}
+
 main() {
   platform_os="$(os)"
   platform_arch="$(arch)"
-  asset="centrol-${platform_os}-${platform_arch}"
+  names="centrol centrol-verify"
   base_url="https://github.com/${REPO}/releases/latest/download"
 
   tmp_dir="$(mktemp -d)"
   trap 'rm -rf "$tmp_dir"' EXIT
-  tmp_bin="${tmp_dir}/${asset}"
   tmp_sums="${tmp_dir}/SHA256SUMS"
 
-  echo "centrol: downloading ${asset}..." >&2
-  fetch "${base_url}/${asset}" "$tmp_bin"
-
-  echo "centrol: verifying checksum..." >&2
   fetch "${base_url}/SHA256SUMS" "$tmp_sums"
 
-  expected="$(awk -v f="$asset" '$2 == f { print $1 }' "$tmp_sums")"
-  if [ -z "$expected" ]; then
-    echo "centrol: ${asset} not listed in SHA256SUMS — refusing to install an unverifiable binary" >&2
-    exit 1
-  fi
+  # Download and verify everything first; install only if all of it checks out.
+  for name in $names; do
+    asset="${name}-${platform_os}-${platform_arch}"
+    echo "centrol: downloading ${asset}..." >&2
+    fetch "${base_url}/${asset}" "${tmp_dir}/${asset}"
 
-  actual="$(sha256_of "$tmp_bin")"
-  if [ "$actual" != "$expected" ]; then
-    echo "centrol: checksum mismatch for ${asset}" >&2
-    echo "  expected: $expected" >&2
-    echo "  actual:   $actual" >&2
-    echo "centrol: refusing to install a binary that doesn't match its published checksum" >&2
-    exit 1
-  fi
-  echo "centrol: checksum OK" >&2
+    expected="$(awk -v f="$asset" '$2 == f { print $1 }' "$tmp_sums")"
+    if [ -z "$expected" ]; then
+      echo "centrol: ${asset} not listed in SHA256SUMS — refusing to install an unverifiable binary" >&2
+      exit 1
+    fi
 
-  chmod +x "$tmp_bin"
-  if [ -w "$INSTALL_DIR" ]; then
-    mv "$tmp_bin" "$INSTALL_DIR/centrol"
-  else
-    echo "centrol: installing to $INSTALL_DIR requires sudo" >&2
-    sudo mv "$tmp_bin" "$INSTALL_DIR/centrol"
-  fi
+    actual="$(sha256_of "${tmp_dir}/${asset}")"
+    if [ "$actual" != "$expected" ]; then
+      echo "centrol: checksum mismatch for ${asset}" >&2
+      echo "  expected: $expected" >&2
+      echo "  actual:   $actual" >&2
+      echo "centrol: refusing to install a binary that doesn't match its published checksum" >&2
+      exit 1
+    fi
+    echo "centrol: checksum OK (${asset})" >&2
+    chmod +x "${tmp_dir}/${asset}"
+  done
 
-  echo "centrol: installed to $INSTALL_DIR/centrol" >&2
+  for name in $names; do
+    install_one "${tmp_dir}/${name}-${platform_os}-${platform_arch}" "$name"
+    echo "centrol: installed to $INSTALL_DIR/$name" >&2
+  done
+
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*) ;;
+    *) echo "centrol: $INSTALL_DIR is not on your PATH; add it to run centrol and centrol-verify by name" >&2 ;;
+  esac
   "$INSTALL_DIR/centrol" 2>&1 | head -1 >&2 || true
 }
 

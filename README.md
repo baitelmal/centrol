@@ -31,9 +31,12 @@ by side:
 
 ## Install
 
-Single static binary, no dependencies. Downloads the release asset for
-your platform and installs it to `/usr/local/bin` (override with
-`CENTROL_INSTALL_DIR`).
+Two static binaries, no dependencies: `centrol`, and `centrol-verify`,
+the standalone reference verifier. The script downloads both release
+assets for your platform, checks each against the release's
+`SHA256SUMS`, and only then installs them together to `/usr/local/bin`
+(override with `CENTROL_INSTALL_DIR`). It uses `sudo` only for the final
+move, and only if that directory is not writable by you.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/baitelmal/centrol/main/install-centrol.sh | sh
@@ -137,8 +140,8 @@ and why), `2` could not read the input.
 
 Download `centrol-verify` from the release assets:
 `centrol-verify-<os>-<arch>` (`darwin` or `linux`, `amd64` or `arm64`).
-Check it against the release's `SHA256SUMS` before you run it. The
-install script installs only `centrol`, not the verifier.
+The install script fetches it and checks it against the release's
+`SHA256SUMS`; if you download it by hand, check it yourself.
 
 The first entry must be seq 1 with an empty prev, so a ledger whose
 oldest entries or leading segments were deleted fails even though every
