@@ -441,12 +441,7 @@ just confirmed is untampered.
 - **v0.2.x** — continued hardening on the v0.2 surfaces
 - **v0.3.0** — shipped: the reference verifier (`centrol-verify`) and the
   tamper reader
-- **v0.3** — still to come: verify, a validator surface: attempt → test → invariant
-  check → packet → approve/reject, gated the same way guard and proxy
-  are today; tape capture (full-fidelity call/response recording) also
-  lands here
-- **v1.0** — stability: the CLI, config keys, and ledger schema are
-  frozen as a compatibility contract
+
 
 No dates are committed. This is the order the surfaces are meant to
 arrive in, not a schedule.
