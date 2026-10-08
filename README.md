@@ -31,15 +31,27 @@ by side:
 
 ## Install
 
-Two static binaries, no dependencies: `centrol`, and `centrol-verify`,
-the standalone reference verifier. The script downloads both release
+centrol runs on macOS, Linux and Windows (amd64 and arm64). The install
+is two static binaries, no dependencies: `centrol`, and `centrol-verify`,
+the standalone reference verifier. Each script downloads both release
 assets for your platform, checks each against the release's
-`SHA256SUMS`, and only then installs them together to `/usr/local/bin`
-(override with `CENTROL_INSTALL_DIR`). It uses `sudo` only for the final
-move, and only if that directory is not writable by you.
+`SHA256SUMS`, and only then installs them together.
+
+macOS and Linux (installs to `/usr/local/bin`; override with
+`CENTROL_INSTALL_DIR`; uses `sudo` only for the final move, and only if
+that directory is not writable by you):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/baitelmal/centrol/main/install-centrol.sh | sh
+```
+
+Windows, in PowerShell (installs to `%LOCALAPPDATA%\Programs\centrol`, a
+per-user directory, so no administrator rights; override with
+`$env:CENTROL_INSTALL_DIR`; it prints the command to add the directory
+to your PATH if it is not already there):
+
+```powershell
+irm https://raw.githubusercontent.com/baitelmal/centrol/main/install-centrol.ps1 | iex
 ```
 
 The canonical repository, and the only install path, is
@@ -139,7 +151,8 @@ valid, `1` chain broken (it reports the first failing sequence number
 and why), `2` could not read the input.
 
 Download `centrol-verify` from the release assets:
-`centrol-verify-<os>-<arch>` (`darwin` or `linux`, `amd64` or `arm64`).
+`centrol-verify-<os>-<arch>` (`darwin`, `linux` or `windows`; `amd64` or
+`arm64`; Windows assets end in `.exe`).
 The install script fetches it and checks it against the release's
 `SHA256SUMS`; if you download it by hand, check it yourself.
 
