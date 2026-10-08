@@ -1,14 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Changed
-
-- `centrol audit --verify` and `centrol-verify` now require the first
-  entry to be seq 1 with an empty prev. A ledger with its oldest entries
-  or leading segments deleted used to verify clean; it now fails.
-  `centrol-verify --first-seq N` verifies a slice of a longer chain
-
 ## v0.3.0 — 2026-10-07
 
 ### Added
@@ -20,6 +11,14 @@
 - Tamper reader: while `centrol guard` or `centrol proxy` runs, an
   external modification to a ledger segment is logged as
   `policy.tamper_detected`
+
+### Changed
+
+- `centrol audit --verify` now requires the first entry to be seq 1
+  with an empty prev. A ledger with its oldest entries or leading
+  segments deleted used to verify clean; it now fails. `centrol-verify`
+  applies the same rule, and `centrol-verify --first-seq N` verifies a
+  slice of a longer chain
 
 ### Notes
 
