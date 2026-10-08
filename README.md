@@ -131,12 +131,12 @@ centrol-verify --first-seq N <path>
 A file is verified as one segment. A directory is verified as one
 continuous chain across a ledger's rotated segments. Exit codes: `0`
 valid, `1` chain broken (it reports the first failing sequence number
-and why), `2` could not read the input. It is built from this
-repository:
+and why), `2` could not read the input.
 
-```sh
-go build -o centrol-verify ./cmd/centrol-verify
-```
+Download `centrol-verify` from the release assets:
+`centrol-verify-<os>-<arch>` (`darwin` or `linux`, `amd64` or `arm64`).
+Check it against the release's `SHA256SUMS` before you run it. The
+install script installs only `centrol`, not the verifier.
 
 The first entry must be seq 1 with an empty prev, so a ledger whose
 oldest entries or leading segments were deleted fails even though every
