@@ -311,3 +311,31 @@ func TestFirstSeqVerifiesASlice(t *testing.T) {
 		t.Errorf("--first-seq 0: exit %d, want 2", code)
 	}
 }
+
+func TestHelpPrintsUsageAndExitsZero(t *testing.T) {
+	for _, flag := range []string{"--help", "-h"} {
+		var out, errb bytes.Buffer
+		if code := run([]string{flag}, &out, &errb); code != 0 {
+			t.Errorf("%s: exit %d, want 0", flag, code)
+		}
+		for _, want := range []string{"Usage:", "--first-seq N", "Exit codes:", "<path>"} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("%s: help missing %q", flag, want)
+			}
+		}
+		if errb.Len() != 0 {
+			t.Errorf("%s: wrote to stderr: %q", flag, errb.String())
+		}
+	}
+}
+
+func TestMissingFileAndValidLedgerStillBehaveAfterHelpFlag(t *testing.T) {
+	if code, _, _ := runCLI(t, filepath.Join(t.TempDir(), "nope.jsonl")); code != 2 {
+		t.Errorf("missing file: exit %d, want 2", code)
+	}
+	path := filepath.Join(t.TempDir(), "lighthouse.jsonl")
+	buildValidLedger(t, path, 3)
+	if code, out, _ := runCLI(t, path); code != 0 || !strings.Contains(out, "OK: 3 entries") {
+		t.Errorf("valid ledger: exit %d, out %q", code, out)
+	}
+}

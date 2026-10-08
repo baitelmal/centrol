@@ -343,10 +343,49 @@ func entriesFor(prev, cur []byte) [][]byte {
 	return [][]byte{prev, cur}
 }
 
+// helpText is printed by -h / --help.
+const helpText = `centrol-verify - check a Centrol ledger's hash chain, offline
+
+It re-derives the hashing rule independently (it imports nothing from
+centrol), so you can verify a ledger without trusting the binary that
+wrote it. It accepts a ledger from any tier.
+
+Usage:
+  centrol-verify [--first-seq N] <path>
+
+Arguments:
+  <path>         a ledger file (lighthouse.jsonl, verified as one segment)
+                 or a .centrol directory (verified as one continuous chain
+                 across its rotated segments)
+
+Flags:
+  --first-seq N  the seq the first entry must have (default 1). Use it to
+                 verify a slice of a longer chain, such as one archived
+                 batch whose manifest names first_seq. With the default, the
+                 first entry must be seq 1 with an empty prev, so a ledger
+                 with its oldest entries removed fails.
+  -h, --help     print this help and exit 0
+
+Exit codes:
+  0  valid: every hash matches, seqs are contiguous, the chain starts where
+     it should
+  1  invalid: the chain is broken (reports the first failing seq and why)
+  2  could not read the input, or bad usage
+
+It cannot detect entries removed from the end of a ledger; that needs a
+copy of the head held somewhere the producer cannot reach.
+`
+
 // run implements the CLI and returns the process exit code, so the
 // tests below can exercise it directly without spawning a subprocess.
 func run(args []string, stdout, stderr io.Writer) int {
 	const usage = "usage: centrol-verify [--first-seq N] <path-to-lighthouse.jsonl-or-segment-directory>"
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			fmt.Fprint(stdout, helpText)
+			return 0
+		}
+	}
 	firstSeq := 1
 	if len(args) == 3 && args[0] == "--first-seq" {
 		n, err := strconv.Atoi(args[1])
