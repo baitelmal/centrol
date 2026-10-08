@@ -1,6 +1,6 @@
 # centrol
 
-<img width="1280" height="640" alt="centrol_1" src="https://github.com/user-attachments/assets/6bf58dbc-6c25-453f-a34e-cfc3a610d012" />
+<img width="1280" height="640" alt="centrol-1" src="https://github.com/user-attachments/assets/1b4ef9b6-250d-485d-9973-641a503832a3" />
 
 A local-first accountability layer for coding agents (Claude Code, Cursor,
 Windsurf, or anything else you run from a terminal or point at an MCP
