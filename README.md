@@ -1,5 +1,7 @@
 # centrol
 
+<img width="1280" height="640" alt="centrol_" src="https://github.com/user-attachments/assets/960287e7-7737-4cd5-827d-76c717e41163" />
+
 A local-first accountability layer for coding agents (Claude Code, Cursor,
 Windsurf, or anything else you run from a terminal or point at an MCP
 server). Free, offline, no telemetry, no account required.
