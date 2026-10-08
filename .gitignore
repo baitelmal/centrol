@@ -1,0 +1,12 @@
+/.centrol/
+/*.tmp
+
+# Dev-tool convention file; use DEVELOPMENT.md instead
+CLAUDE.md
+
+# Local-only dev doc
+DEVELOPMENT.md
+
+# Build outputs at the repo root (anchored: cmd/centrol and cmd/centrol-verify are source)
+/centrol
+/centrol-verify
