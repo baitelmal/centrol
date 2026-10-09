@@ -113,17 +113,19 @@ path is never touched, that guarantee exists on the proxy path, not the
 guard path.
 
 Making the guard automatic (optional)
-The guard is per-session by design — it needs a start and end boundary so undo has something to restore to. If you want every invocation of an agent to be guarded, add a shell alias. This is a user-side convenience; the tool doesn't install it for you.
+The guard is per-session by design — it needs a start and end boundary so undo has something to restore to. If you want every invocation of an agent to be guarded, add a shell alias. This is a user-side convenience; the tool doesn't install it for you. 
 
 macOS / Linux (in ~/.bashrc or ~/.zshrc):
 
-bash
-alias claude='centrol guard -- claude'
+_alias claude='centrol guard -- claude'_
+
+
 Windows (in $PROFILE, the PowerShell profile):
 
-powershell
-function claude { centrol guard -- claude @args }
+_function claude { centrol guard -- claude @args }_
+
 After adding, reload your shell (source ~/.bashrc or restart PowerShell). To skip the guard for a single invocation, use the raw binary (\claude on Mac/Linux, claude.exe on Windows).
+
 
 ## Detection and verification
 
