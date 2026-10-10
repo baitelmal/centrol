@@ -232,7 +232,7 @@ func mkdir(t *testing.T, dir string) {
 func TestWindowsResolvesMSIXContainer(t *testing.T) {
 	env, msix, _ := winLayout(t)
 	mkdir(t, msix)
-	got, _ := claudeDesktopWindowsPath(env)
+	got := claudeDesktopWindowsPath(env).Path
 	if want := filepath.Join(msix, "claude_desktop_config.json"); got != want {
 		t.Fatalf("path = %s, want the MSIX path %s", got, want)
 	}
@@ -243,7 +243,7 @@ func TestWindowsMSIXPublisherHashIsGlobbed(t *testing.T) {
 	env, _, _ := winLayout(t)
 	other := filepath.Join(env.LocalAppData, "Packages", "Claude_zzz999other", "LocalCache", "Roaming", "Claude")
 	mkdir(t, other)
-	got, _ := claudeDesktopWindowsPath(env)
+	got := claudeDesktopWindowsPath(env).Path
 	if want := filepath.Join(other, "claude_desktop_config.json"); got != want {
 		t.Fatalf("path = %s, want %s", got, want)
 	}
@@ -252,7 +252,7 @@ func TestWindowsMSIXPublisherHashIsGlobbed(t *testing.T) {
 func TestWindowsOnlyClassicPathPresent(t *testing.T) {
 	env, _, classic := winLayout(t)
 	mkdir(t, classic)
-	got, _ := claudeDesktopWindowsPath(env)
+	got := claudeDesktopWindowsPath(env).Path
 	if want := filepath.Join(classic, "claude_desktop_config.json"); got != want {
 		t.Fatalf("path = %s, want the classic path %s", got, want)
 	}
@@ -262,7 +262,7 @@ func TestWindowsBothPresentPrefersMSIX(t *testing.T) {
 	env, msix, classic := winLayout(t)
 	mkdir(t, msix)
 	mkdir(t, classic)
-	got, _ := claudeDesktopWindowsPath(env)
+	got := claudeDesktopWindowsPath(env).Path
 	if want := filepath.Join(msix, "claude_desktop_config.json"); got != want {
 		t.Fatalf("path = %s, want MSIX %s when both exist", got, want)
 	}
@@ -274,7 +274,7 @@ func TestWindowsIgnoresPackageWithoutConfigDir(t *testing.T) {
 	env, _, classic := winLayout(t)
 	mkdir(t, filepath.Join(env.LocalAppData, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache"))
 	mkdir(t, classic)
-	got, _ := claudeDesktopWindowsPath(env)
+	got := claudeDesktopWindowsPath(env).Path
 	if want := filepath.Join(classic, "claude_desktop_config.json"); got != want {
 		t.Fatalf("path = %s, want classic %s", got, want)
 	}
@@ -284,15 +284,15 @@ func TestWindowsIgnoresPackageWithoutConfigDir(t *testing.T) {
 // "does not exist yet" error fires, and the message names both paths.
 func TestWindowsNeitherPresentErrorNamesBothPaths(t *testing.T) {
 	env, _, classic := winLayout(t)
-	path, checked := claudeDesktopWindowsPath(env)
-	if want := filepath.Join(classic, "claude_desktop_config.json"); path != want {
-		t.Fatalf("path = %s, want the classic path %s", path, want)
+	lk := claudeDesktopWindowsPath(env)
+	if want := filepath.Join(classic, "claude_desktop_config.json"); lk.Path != want || lk.MSIX {
+		t.Fatalf("path = %s (msix %v), want the classic path %s", lk.Path, lk.MSIX, want)
 	}
-	if len(checked) != 2 {
-		t.Fatalf("checked = %v, want the MSIX pattern and the classic path", checked)
+	if len(lk.Checked) != 2 {
+		t.Fatalf("checked = %v, want the MSIX pattern and the classic path", lk.Checked)
 	}
-	msg := missingConfigMessage("claude-desktop", checked)
-	for _, want := range []string{"does not exist yet", filepath.Join("Packages", "Claude_*"), checked[1]} {
+	msg := missingConfigMessage("claude-desktop", lk)
+	for _, want := range []string{"does not exist yet", filepath.Join("Packages", "Claude_*"), lk.Checked[1]} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message missing %q:\n%s", want, msg)
 		}
@@ -332,5 +332,40 @@ func TestProxyInstallPatchesTheMSIXConfig(t *testing.T) {
 	}
 	if classicCmd != "npx" {
 		t.Error("the classic config was patched although the MSIX one exists")
+	}
+}
+
+// MSIX container present but its config not yet written, and a classic
+// config exists: the message must say which one the app reads, why the
+// classic one is not patched, and how to use it anyway.
+func TestWindowsMSIXWithoutConfigAndClassicPresentExplainsItself(t *testing.T) {
+	env, msix, classic := winLayout(t)
+	mkdir(t, msix)
+	mkdir(t, classic)
+	if err := os.WriteFile(filepath.Join(classic, "claude_desktop_config.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lk := claudeDesktopWindowsPath(env)
+	if !lk.MSIX || !lk.ClassicExists {
+		t.Fatalf("lookup = %+v, want MSIX with an existing classic config", lk)
+	}
+	msg := missingConfigMessage("claude-desktop", lk)
+	for _, want := range []string{
+		"Store (MSIX)", filepath.Join(msix, "claude_desktop_config.json"), "open claude-desktop once",
+		filepath.Join(classic, "claude_desktop_config.json"), "does not read it", "remove the Store package",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+// MSIX alone: no mention of a classic config the user does not have.
+func TestWindowsMSIXWithoutConfigAndNoClassicStaysShort(t *testing.T) {
+	env, msix, _ := winLayout(t)
+	mkdir(t, msix)
+	msg := missingConfigMessage("claude-desktop", claudeDesktopWindowsPath(env))
+	if !strings.Contains(msg, "open claude-desktop once") || strings.Contains(msg, "does not read it") {
+		t.Errorf("unexpected message:\n%s", msg)
 	}
 }
