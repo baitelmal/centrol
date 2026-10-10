@@ -1,9 +1,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -139,6 +142,12 @@ func cmdGuard(args []string) {
 		// recorded outcome agrees.
 		if cause, code, ok := signalCauseFromErr(err); ok {
 			end(cause, code, nil)
+			return
+		}
+		if errors.Is(err, guard.ErrNoCommits) {
+			end("no_commits", ui.ExitUserError, func() {
+				fmt.Fprint(os.Stderr, noCommitsMessage)
+			})
 			return
 		}
 		end("snapshot_failed", 1, func() {
@@ -309,6 +318,9 @@ func cmdGuard(args []string) {
 	if runErr != nil {
 		end("agent_run_error", 1, func() {
 			fmt.Fprintf(os.Stderr, "centrol guard: running agent: %v\n", runErr)
+			if hint := missingCommandHint(runErr, runtime.GOOS); hint != "" {
+				fmt.Fprintln(os.Stderr, hint)
+			}
 		})
 		return
 	}
@@ -366,4 +378,26 @@ func extractGuardFlags(args []string) (scopePaths []string, observe, quiet, verb
 		}
 	}
 	return scopePaths, observe, quiet, verbose, rest
+}
+
+// noCommitsMessage is what `centrol guard` prints in a git repo that has
+// no commits yet, instead of the raw git rev-parse error.
+const noCommitsMessage = `centrol guard: this repo has no commits yet.
+Make an initial commit before running the guard — there is
+nothing to snapshot.
+`
+
+// windowsExecHint follows the "executable file not found" error on Windows.
+const windowsExecHint = `On Windows, the wrapped command must be a real executable.
+Shell builtins need ` + "`cmd /c`" + `:  centrol guard -- cmd /c "echo hi"`
+
+// missingCommandHint returns the extra line to print after err when the
+// wrapped command could not be found, or "" when none applies. The hint
+// is Windows-only: shell builtins like echo are real programs on Unix
+// systems, and the cmd /c advice means nothing there.
+func missingCommandHint(err error, goos string) string {
+	if goos == "windows" && errors.Is(err, exec.ErrNotFound) {
+		return windowsExecHint
+	}
+	return ""
 }

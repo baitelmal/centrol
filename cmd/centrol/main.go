@@ -7,6 +7,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
+	"strings"
 )
 
 func main() {
@@ -31,6 +33,8 @@ func main() {
 		cmdConfig(os.Args[2:])
 	case "verify":
 		cmdVerify(os.Args[2:])
+	case "--version", "-v":
+		fmt.Println(versionString())
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -38,6 +42,49 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+// versionString describes this build from the build info the Go toolchain
+// stamps into the binary: the module version when there is one (a
+// `go install pkg@vX.Y.Z` build), and the VCS revision for a build from a
+// checkout. Nothing is hardcoded.
+func versionString() string {
+	info, ok := debug.ReadBuildInfo()
+	return formatVersion(info, ok)
+}
+
+func formatVersion(info *debug.BuildInfo, ok bool) string {
+	if !ok || info == nil {
+		return "centrol (version unknown)"
+	}
+	version := info.Main.Version
+	var rev string
+	var modified bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			modified = s.Value == "true"
+		}
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	var parts []string
+	if version != "" && version != "(devel)" {
+		parts = append(parts, version)
+	}
+	if rev != "" {
+		if modified {
+			rev += "+modified"
+		}
+		parts = append(parts, rev)
+	}
+	if len(parts) == 0 {
+		return "centrol (version unknown)"
+	}
+	return "centrol " + strings.Join(parts, " ")
 }
 
 func printUsage() {
@@ -56,6 +103,7 @@ Usage:
   centrol scope +<path>                  widen the current run's contract
   centrol status                         active run, contract, honesty score
   centrol config                         interactive menu: allowlist, gate, proxy, guard, general, thresholds
+  centrol --version                      print the build version
   centrol verify                         [reserved for v0.3] validate a change before it lands
 
 Logging:

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -148,6 +149,10 @@ func (g *GitRunner) exec(repoRoot string, args ...string) ([]byte, error) {
 	return out, nil
 }
 
+// ErrNoCommits is returned by Snapshot when the repo has no commits yet,
+// so there is no HEAD to snapshot against.
+var ErrNoCommits = errors.New("snapshot: repo has no commits")
+
 // Snapshot writes the four required components under snapshotDir:
 // head.txt, stash.diff, untracked/, manifest.json. It never mutates the
 // repo (git stash create does not touch the working tree or the stash
@@ -165,6 +170,14 @@ func Snapshot(repoRoot, snapshotDir string, ignore *IgnoreSet, git *GitRunner) e
 
 	head, err := git.run(repoRoot, "rev-parse", "HEAD")
 	if err != nil {
+		// A repo with no commits has no HEAD to resolve. Tell that case
+		// apart from every other rev-parse failure (corrupt repo, timeout,
+		// ...), which keeps its original error: a repo with no refs at all
+		// has no commits, while any ref at all means HEAD failed for some
+		// other reason.
+		if refs, refErr := git.run(repoRoot, "for-each-ref", "--count=1"); refErr == nil && refs == "" {
+			return ErrNoCommits
+		}
 		return fmt.Errorf("snapshot: resolving HEAD: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(snapshotDir, "head.txt"), []byte(head+"\n"), 0o600); err != nil {
