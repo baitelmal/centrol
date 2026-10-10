@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -200,5 +201,136 @@ func TestRemoteURL(t *testing.T) {
 				t.Fatalf("remoteURL(%v) = (%q, %v), want (%q, %v)", tc.entry, gotURL, gotOK, tc.wantURL, tc.wantOK)
 			}
 		})
+	}
+}
+
+// --- Windows: MSIX-virtualized Claude Desktop ---------------------------
+
+// winLayout builds a fake Windows profile under a temp dir and returns
+// the environment plus the MSIX container dir and classic dir paths
+// (neither created yet).
+func winLayout(t *testing.T) (env windowsEnv, msixDir, classicDir string) {
+	t.Helper()
+	root := t.TempDir()
+	env = windowsEnv{
+		Home:         filepath.Join(root, "home"),
+		AppData:      filepath.Join(root, "home", "AppData", "Roaming"),
+		LocalAppData: filepath.Join(root, "home", "AppData", "Local"),
+	}
+	msixDir = filepath.Join(env.LocalAppData, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache", "Roaming", "Claude")
+	classicDir = filepath.Join(env.AppData, "Claude")
+	return env, msixDir, classicDir
+}
+
+func mkdir(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWindowsResolvesMSIXContainer(t *testing.T) {
+	env, msix, _ := winLayout(t)
+	mkdir(t, msix)
+	got, _ := claudeDesktopWindowsPath(env)
+	if want := filepath.Join(msix, "claude_desktop_config.json"); got != want {
+		t.Fatalf("path = %s, want the MSIX path %s", got, want)
+	}
+}
+
+// The publisher hash is globbed, not hardcoded.
+func TestWindowsMSIXPublisherHashIsGlobbed(t *testing.T) {
+	env, _, _ := winLayout(t)
+	other := filepath.Join(env.LocalAppData, "Packages", "Claude_zzz999other", "LocalCache", "Roaming", "Claude")
+	mkdir(t, other)
+	got, _ := claudeDesktopWindowsPath(env)
+	if want := filepath.Join(other, "claude_desktop_config.json"); got != want {
+		t.Fatalf("path = %s, want %s", got, want)
+	}
+}
+
+func TestWindowsOnlyClassicPathPresent(t *testing.T) {
+	env, _, classic := winLayout(t)
+	mkdir(t, classic)
+	got, _ := claudeDesktopWindowsPath(env)
+	if want := filepath.Join(classic, "claude_desktop_config.json"); got != want {
+		t.Fatalf("path = %s, want the classic path %s", got, want)
+	}
+}
+
+func TestWindowsBothPresentPrefersMSIX(t *testing.T) {
+	env, msix, classic := winLayout(t)
+	mkdir(t, msix)
+	mkdir(t, classic)
+	got, _ := claudeDesktopWindowsPath(env)
+	if want := filepath.Join(msix, "claude_desktop_config.json"); got != want {
+		t.Fatalf("path = %s, want MSIX %s when both exist", got, want)
+	}
+}
+
+// A Claude_* directory without the Roaming\Claude subtree is not the
+// config container.
+func TestWindowsIgnoresPackageWithoutConfigDir(t *testing.T) {
+	env, _, classic := winLayout(t)
+	mkdir(t, filepath.Join(env.LocalAppData, "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache"))
+	mkdir(t, classic)
+	got, _ := claudeDesktopWindowsPath(env)
+	if want := filepath.Join(classic, "claude_desktop_config.json"); got != want {
+		t.Fatalf("path = %s, want classic %s", got, want)
+	}
+}
+
+// With neither present the classic path is returned, so the caller's
+// "does not exist yet" error fires, and the message names both paths.
+func TestWindowsNeitherPresentErrorNamesBothPaths(t *testing.T) {
+	env, _, classic := winLayout(t)
+	path, checked := claudeDesktopWindowsPath(env)
+	if want := filepath.Join(classic, "claude_desktop_config.json"); path != want {
+		t.Fatalf("path = %s, want the classic path %s", path, want)
+	}
+	if len(checked) != 2 {
+		t.Fatalf("checked = %v, want the MSIX pattern and the classic path", checked)
+	}
+	msg := missingConfigMessage("claude-desktop", checked)
+	for _, want := range []string{"does not exist yet", filepath.Join("Packages", "Claude_*"), checked[1]} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+// End to end through cmdProxyInstall with the Windows branch selected:
+// the MSIX file is the one patched, the classic one is left alone, and
+// a missing config file inside an existing MSIX dir is read as absent
+// rather than created.
+func TestProxyInstallPatchesTheMSIXConfig(t *testing.T) {
+	env, msix, classic := winLayout(t)
+	t.Setenv("HOME", env.Home)
+	t.Setenv("USERPROFILE", env.Home)
+	t.Setenv("APPDATA", env.AppData)
+	t.Setenv("LOCALAPPDATA", env.LocalAppData)
+	old := installGOOS
+	installGOOS = "windows"
+	defer func() { installGOOS = old }()
+
+	doc, _ := json.Marshal(map[string]interface{}{"mcpServers": map[string]interface{}{
+		"fs": map[string]interface{}{"command": "npx", "args": []interface{}{"x"}},
+	}})
+	for _, dir := range []string{msix, classic} {
+		mkdir(t, dir)
+		if err := os.WriteFile(filepath.Join(dir, "claude_desktop_config.json"), doc, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cmdProxyInstall([]string{"claude-desktop"})
+
+	msixCmd := readServers(t, filepath.Join(msix, "claude_desktop_config.json"))["fs"].(map[string]interface{})["command"]
+	classicCmd := readServers(t, filepath.Join(classic, "claude_desktop_config.json"))["fs"].(map[string]interface{})["command"]
+	if msixCmd == "npx" {
+		t.Error("the MSIX config was not patched")
+	}
+	if classicCmd != "npx" {
+		t.Error("the classic config was patched although the MSIX one exists")
 	}
 }

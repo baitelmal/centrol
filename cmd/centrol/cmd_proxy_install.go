@@ -10,36 +10,100 @@ import (
 	"time"
 )
 
+// installGOOS is runtime.GOOS; a variable so tests can exercise the
+// Windows path resolution on any platform.
+var installGOOS = runtime.GOOS
+
+const claudeDesktopConfigFile = "claude_desktop_config.json"
+
+// windowsEnv is the Windows environment the Claude Desktop lookup reads.
+type windowsEnv struct {
+	Home         string // the user's home directory
+	AppData      string // %APPDATA%, may be empty
+	LocalAppData string // %LOCALAPPDATA%, may be empty
+}
+
+// claudeDesktopWindowsPath picks Claude Desktop's config path on Windows
+// and lists every path it considered, in order.
+//
+// The Store (MSIX) build of Claude Desktop runs in a per-package
+// container, and Windows redirects its %APPDATA% writes to
+//
+//	%LOCALAPPDATA%\Packages\Claude_<publisher hash>\LocalCache\Roaming\Claude\
+//
+// so that is the file the running app reads. The publisher hash is
+// globbed, never hardcoded. If that directory exists it wins, because
+// patching the classic file would have no effect on the app; whether
+// the config file inside it exists yet is the caller's business. The
+// classic installer's %APPDATA%\Claude\ is the fallback, and is the
+// answer when neither exists so the caller's "does not exist yet"
+// error names it.
+func claudeDesktopWindowsPath(e windowsEnv) (path string, checked []string) {
+	localAppData := e.LocalAppData
+	if localAppData == "" {
+		localAppData = filepath.Join(e.Home, "AppData", "Local")
+	}
+	appData := e.AppData
+	if appData == "" {
+		appData = filepath.Join(e.Home, "AppData", "Roaming")
+	}
+
+	msixDirPattern := filepath.Join(localAppData, "Packages", "Claude_*", "LocalCache", "Roaming", "Claude")
+	checked = append(checked, filepath.Join(msixDirPattern, claudeDesktopConfigFile))
+	if matches, err := filepath.Glob(msixDirPattern); err == nil {
+		for _, dir := range matches { // Glob returns them sorted
+			if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+				return filepath.Join(dir, claudeDesktopConfigFile), checked
+			}
+		}
+	}
+
+	classic := filepath.Join(appData, "Claude", claudeDesktopConfigFile)
+	checked = append(checked, classic)
+	return classic, checked
+}
+
 // clientConfigPath returns the MCP config file path for a known client,
-// per each client's own documented config location. Best-effort: these
-// paths are a moving target across client versions, so `proxy install`
-// backs up whatever it finds before touching it (see cmdProxyInstall).
-func clientConfigPath(client string) (string, error) {
+// per each client's own documented config location, and every path it
+// considered (the same single path for most clients). Best-effort:
+// these paths are a moving target across client versions, so `proxy
+// install` backs up whatever it finds before touching it (see
+// cmdProxyInstall).
+func clientConfigPath(client string) (path string, checked []string, err error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("resolving home directory: %w", err)
+		return "", nil, fmt.Errorf("resolving home directory: %w", err)
 	}
+	one := func(p string) (string, []string, error) { return p, []string{p}, nil }
 	switch client {
 	case "claude-desktop":
-		switch runtime.GOOS {
+		switch installGOOS {
 		case "darwin":
-			return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), nil
+			return one(filepath.Join(home, "Library", "Application Support", "Claude", claudeDesktopConfigFile))
 		case "windows":
-			appData := os.Getenv("APPDATA")
-			if appData == "" {
-				appData = filepath.Join(home, "AppData", "Roaming")
-			}
-			return filepath.Join(appData, "Claude", "claude_desktop_config.json"), nil
+			p, c := claudeDesktopWindowsPath(windowsEnv{Home: home, AppData: os.Getenv("APPDATA"), LocalAppData: os.Getenv("LOCALAPPDATA")})
+			return p, c, nil
 		default: // linux: community builds only, but this is the documented path
-			return filepath.Join(home, ".config", "Claude", "claude_desktop_config.json"), nil
+			return one(filepath.Join(home, ".config", "Claude", claudeDesktopConfigFile))
 		}
 	case "cursor":
-		return filepath.Join(home, ".cursor", "mcp.json"), nil
+		return one(filepath.Join(home, ".cursor", "mcp.json"))
 	case "windsurf":
-		return filepath.Join(home, ".codeium", "windsurf", "mcp_config.json"), nil
+		return one(filepath.Join(home, ".codeium", "windsurf", "mcp_config.json"))
 	default:
-		return "", fmt.Errorf("unknown client %q (known: claude-desktop, cursor, windsurf)", client)
+		return "", nil, fmt.Errorf("unknown client %q (known: claude-desktop, cursor, windsurf)", client)
 	}
+}
+
+// missingConfigMessage is the error for a client whose config file does
+// not exist, naming every path that was checked so the next user is not
+// left guessing which location the tool looked in.
+func missingConfigMessage(client string, checked []string) string {
+	msg := fmt.Sprintf("centrol proxy install: %s does not exist yet. Looked for its config at:", client)
+	for _, p := range checked {
+		msg += "\n  " + p
+	}
+	return msg + fmt.Sprintf("\nopen %s once first so it creates its config, then re-run this", client)
 }
 
 // remoteURL reports the remote server URL an entry declares, checking
@@ -74,7 +138,7 @@ func cmdProxyInstall(args []string) {
 		fatalf("centrol proxy install: usage: centrol proxy install <claude-desktop|cursor|windsurf>")
 	}
 	client := args[0]
-	path, err := clientConfigPath(client)
+	path, checked, err := clientConfigPath(client)
 	if err != nil {
 		fatalf("centrol proxy install: %v", err)
 	}
@@ -87,7 +151,7 @@ func cmdProxyInstall(args []string) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			fatalf("centrol proxy install: %s does not exist yet — open %s once first so it creates its config, then re-run this", client, client)
+			fatalf("%s", missingConfigMessage(client, checked))
 		}
 		fatalf("centrol proxy install: reading %s: %v", path, err)
 	}
