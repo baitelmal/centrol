@@ -13,6 +13,11 @@
   `policy.tamper_detected`
 - `centrol-verify` now ships as a release binary (previously
   build-from-source)
+- Windows support (amd64 and arm64): release binaries and
+  `install-centrol.ps1`, which installs both binaries per user after
+  checking them against `SHA256SUMS`. The macOS/Linux install script now
+  installs `centrol-verify` too
+- `centrol --version` (and `-v`) prints the release version
 
 ### Changed
 
@@ -21,6 +26,20 @@
   segments deleted used to verify clean; it now fails. `centrol-verify`
   applies the same rule, and `centrol-verify --first-seq N` verifies a
   slice of a longer chain
+
+### Fixed
+
+- `centrol proxy install claude-desktop` on Windows now finds the config
+  of the Microsoft Store (MSIX) Claude Desktop, which lives inside the
+  package folder, and prefers it over a classic config when both exist.
+  If the Store app has not created its config yet, the error says where
+  it will be and what to do
+- `centrol guard` in a repo with no commits yet now says so, instead of
+  printing the raw `git rev-parse` error
+- A wrapped command that is not found on Windows now adds a hint that it
+  must be a real executable, and that shell builtins need `cmd /c`
+- A guard that fails during its snapshot no longer prints a "Run
+  complete" summary before the error
 
 ### Notes
 

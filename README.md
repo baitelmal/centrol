@@ -215,6 +215,7 @@ centrol proxy --target <mcp server>    run the MCP gateway, fronting a stdio MCP
 centrol proxy --target-url <url>       same, fronting an HTTP MCP server instead (see "HTTP MCP servers" below)
 centrol proxy --observe --target ...   same evaluate-only mode, for the MCP path
 centrol proxy install <client>         patch a client's MCP config
+centrol --version                      print the build version
 centrol audit                          view the ledger
 centrol audit --flagged                only policy.violation entries
 centrol audit --blocked                only tool.blocked entries
@@ -261,6 +262,14 @@ is safe to re-run — an already-wrapped entry (stdio or remote) is left
 alone. The client needs to have been opened at least once already, so
 its config file exists; restart the client afterward for the change to
 take effect.
+
+On Windows, Claude Desktop from the Microsoft Store (an MSIX package)
+keeps its config inside the package's own folder, not in `%APPDATA%`.
+`proxy install claude-desktop` finds that file and patches it, and it
+prefers it over a classic `%APPDATA%\Claude` config when both exist,
+because the Store app is the one that runs and never reads the classic
+file. If the Store app has not created its config yet, the command says
+where the file will be: open the app once, then re-run.
 
 ## HTTP MCP servers
 
