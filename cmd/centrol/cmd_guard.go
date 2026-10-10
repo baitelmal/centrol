@@ -144,13 +144,17 @@ func cmdGuard(args []string) {
 			end(cause, code, nil)
 			return
 		}
+		// The snapshot failures below are failed startups: the wrapped
+		// command never ran, so they print the error and no "Run
+		// complete" summary.
+		endStartup := endRunOpts(g, runID, ledgerPath(root), started, counters, clearMarker, false)
 		if errors.Is(err, guard.ErrNoCommits) {
-			end("no_commits", ui.ExitUserError, func() {
+			endStartup("no_commits", ui.ExitUserError, func() {
 				fmt.Fprint(os.Stderr, noCommitsMessage)
 			})
 			return
 		}
-		end("snapshot_failed", 1, func() {
+		endStartup("snapshot_failed", 1, func() {
 			fmt.Fprintf(os.Stderr, "centrol guard: snapshot failed, refusing to run ungoverned: %v\n", err)
 		})
 		return

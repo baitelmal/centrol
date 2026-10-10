@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -20,6 +21,9 @@ func TestGuardInRepoWithNoCommitsSaysSo(t *testing.T) {
 	if !strings.Contains(stderr, "centrol guard: this repo has no commits yet.") ||
 		!strings.Contains(stderr, "Make an initial commit before running the guard") {
 		t.Fatalf("missing the no-commits message; stderr:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "Run complete") {
+		t.Fatalf("a failed startup printed the run summary; stderr:\n%s", stderr)
 	}
 	for _, leak := range []string{"rev-parse", "ambiguous argument", "resolving HEAD", "exit status 128"} {
 		if strings.Contains(stderr, leak) {
@@ -96,3 +100,63 @@ func TestFormatVersion(t *testing.T) {
 }
 
 var windowsHost = runtime.GOOS == "windows"
+
+func TestResolveVersionPrefersStampedValue(t *testing.T) {
+	bi := &debug.BuildInfo{Main: debug.Module{Version: "v9.9.9"}}
+	if got := resolveVersion("v0.3.0", bi, true); got != "centrol v0.3.0" {
+		t.Fatalf("stamped: %q", got)
+	}
+	if got := resolveVersion("v0.3.0", nil, false); got != "centrol v0.3.0" {
+		t.Fatalf("stamped, no build info: %q", got)
+	}
+	if got := resolveVersion("", bi, true); got != "centrol v9.9.9" {
+		t.Fatalf("dev fallback to build info: %q", got)
+	}
+	if got := resolveVersion("", nil, false); got != "centrol (version unknown)" {
+		t.Fatalf("nothing available: %q", got)
+	}
+}
+
+// buildWithLdflags builds cmd/centrol the way a release build does.
+func buildWithLdflags(t *testing.T, ldflags string) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "centrol-stamped")
+	args := []string{"build", "-o", out}
+	if ldflags != "" {
+		args = append(args, "-ldflags", ldflags)
+	}
+	args = append(args, ".")
+	cmd := exec.Command("go", args...)
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, b)
+	}
+	return out
+}
+
+func TestVersionStampedViaLdflags(t *testing.T) {
+	bin := buildWithLdflags(t, "-X main.version=v0.3.0")
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil || string(out) != "centrol v0.3.0\n" {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+	out, err = exec.Command(bin, "-v").Output()
+	if err != nil || string(out) != "centrol v0.3.0\n" {
+		t.Fatalf("-v: out=%q err=%v", out, err)
+	}
+}
+
+func TestVersionDevBuildFallsBackToBuildInfo(t *testing.T) {
+	bin := buildWithLdflags(t, "")
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil || !strings.HasPrefix(string(out), "centrol ") || strings.Contains(string(out), "v0.3.0\n") {
+		t.Fatalf("out=%q err=%v", out, err)
+	}
+}
+
+func TestSuccessfulGuardRunStillPrintsSummary(t *testing.T) {
+	dir := initTestRepo(t)
+	_, stderr, code := centrol(t, dir, "guard", "--", "sh", "-c", "exit 0")
+	if code != 0 || !strings.Contains(stderr, "Run complete") {
+		t.Fatalf("code=%d, want the summary; stderr:\n%s", code, stderr)
+	}
+}

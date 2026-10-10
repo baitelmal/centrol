@@ -44,12 +44,27 @@ func main() {
 	}
 }
 
-// versionString describes this build from the build info the Go toolchain
-// stamps into the binary: the module version when there is one (a
-// `go install pkg@vX.Y.Z` build), and the VCS revision for a build from a
-// checkout. Nothing is hardcoded.
+// version is stamped at release build time:
+//
+//	go build -ldflags "-X main.version=v0.3.0" ./cmd/centrol
+//
+// It is empty in a dev build, which then describes itself from Go's
+// build info.
+var version = ""
+
+// versionString is the one line `centrol --version` prints.
 func versionString() string {
 	info, ok := debug.ReadBuildInfo()
+	return resolveVersion(version, info, ok)
+}
+
+// resolveVersion prefers the stamped release version, then the build
+// info the Go toolchain embeds (module version and VCS revision), then
+// admits it does not know.
+func resolveVersion(stamped string, info *debug.BuildInfo, ok bool) string {
+	if stamped != "" {
+		return "centrol " + stamped
+	}
 	return formatVersion(info, ok)
 }
 

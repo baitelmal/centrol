@@ -147,10 +147,22 @@ func printRunSummary(w io.Writer, runID, ledgerFile string, started time.Time, c
 // win-specific message) happens at most once, guarded by its own
 // sync.Once, regardless of which call reaches it first.
 func endRun(g *governor.Governor, runID, ledgerFile string, started time.Time, counters *runCounters, clearMarker func()) func(cause string, code int, printMsg func()) {
+	return endRunOpts(g, runID, ledgerFile, started, counters, clearMarker, true)
+}
+
+// endRunOpts is endRun with control over the run summary. With
+// summary=false, a call that wins the race to decide the run's outcome
+// finishes without the "Run complete" summary: it is for a startup that
+// failed before the wrapped command ever ran, where "Run complete" would
+// be false. A call that loses the race still prints the summary, since
+// someone else (a signal) decided the outcome and the run did get going.
+func endRunOpts(g *governor.Governor, runID, ledgerFile string, started time.Time, counters *runCounters, clearMarker func(), summary bool) func(cause string, code int, printMsg func()) {
 	var finished sync.Once
-	finish := func(printMsg func()) {
+	finish := func(printMsg func(), withSummary bool) {
 		finished.Do(func() {
-			printRunSummary(os.Stderr, runID, ledgerFile, started, counters)
+			if withSummary {
+				printRunSummary(os.Stderr, runID, ledgerFile, started, counters)
+			}
 			clearMarker()
 			if printMsg != nil {
 				printMsg()
@@ -159,7 +171,7 @@ func endRun(g *governor.Governor, runID, ledgerFile string, started time.Time, c
 	}
 	return func(cause string, code int, printMsg func()) {
 		if g.Stop(cause, code) {
-			finish(printMsg)
+			finish(printMsg, summary)
 		} else {
 			// Someone else's Stop call already decided the run's
 			// outcome; still finish (exactly once, via the shared
@@ -167,7 +179,7 @@ func endRun(g *governor.Governor, runID, ledgerFile string, started time.Time, c
 			// summary or a cleared marker just because this call lost
 			// the race, and still terminate with the winning decision's
 			// recorded exit code.
-			finish(nil)
+			finish(nil, true)
 		}
 		g.Exit()
 	}
