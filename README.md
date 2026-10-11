@@ -2,17 +2,41 @@
 
 <img width="1280" height="640" alt="centrol-1" src="https://github.com/user-attachments/assets/1b4ef9b6-250d-485d-9973-641a503832a3" />
 
-A local-first accountability layer for coding agents (Claude Code, Cursor,
-Windsurf, or anything else you run from a terminal or point at an MCP
-server). Free, offline, no telemetry, no account required.
+Centrol: The Independent Flight Recorder for AI Agents
 
-centrol doesn't control everything your agent can do — only what passes
-through the two interfaces it wraps, the filesystem and MCP tool calls.
-Within those, it blocks what violates policy and gives you an
-append-only, hash-chained record of everything else, so you can review
-it, verify it hasn't been tampered with, and roll it back.
+ A local-first accountability layer for coding agents (Claude Code, Cursor, Windsurf, or anything else you run from a terminal or point at an MCP server). 
+ 
+When you let an AI agent work on your machine — running commands, editing files, calling tools — the only record of what it did is usually the agent's own log. But if an agent goes off the rails, its own log is the one thing you can't trust, because the agent wrote it about itself.
 
-## See it in action
+Centrol sits completely outside the agent. It writes an independent, tamper-evident record that the agent cannot touch or alter. When something goes wrong, you can see what actually happened and prove it — to a teammate, a reviewer, or anyone who wasn't watching — without asking anyone to take the agent's word for it. 
+
+This gives you the management, insight, and visibility you're missing — through a truth ledger you can use to assess decisions, direction, stages, and deviations, and to build confidence and trust in your agents.
+
+AI is a black box. Centrol clears the ambiguity.
+
+Eliminate agent blind spots before they catch up to you.
+
+Free. Runs entirely on your machine. No cloud, no account, no telemetry. Nothing leaves your computer.
+
+Centrol covers the two main paths agents act through, the filesystem and MCP tool calls. Within those, it blocks what violates policy and records everything else to an append-only, hash-chained ledger you can review, verify, and roll back.
+
+## How it works 
+| Command | What it does |
+|---|---|
+| `centrol proxy install <client>` | One-command setup. Rewrites your MCP config so every server launches through the proxy automatically. Do this once and it runs on every subsequent call. |
+| `centrol proxy` | Puts the MCP gateway in front of your servers — the main channel an agent uses — so you can monitor and control access through allowlists. |
+| `centrol guard` | Run an agent you don't fully trust under guard. Every action is recorded out-of-band, and a snapshot is taken before it starts so you can roll back afterward. |
+| `centrol undo` | Restores state to the last snapshot, with full provenance in the ledger showing what changed and why. |
+| `centrol undo --list` | Shows a list of historical snapshots available to revert to. |
+| `centrol undo --from <id>` | Restores a specific snapshot by ID instead of the most recent one. |
+| `centrol audit` | Opens the historical ledger so you can read back exactly what an agent did. |
+| `centrol audit --verify` | Runs a hash-chain integrity check across every segment of the ledger. No network required — verification is entirely local. |
+| `centrol scope +<path>` | If you've set restrictions on a run and need to widen them, this opens the scope to allow a path for that run only. |
+| `centrol status` | Current health check: the active run, its contract, and ledger integrity. |
+| `centrol config` | Interactive menu for allowlists, gates, and thresholds. |
+
+
+## See it in action 
 
 `centrol proxy` hard-blocking a tool call that reaches for a credential
 path, before it ever touches the target MCP server:
