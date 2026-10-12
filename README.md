@@ -18,7 +18,33 @@ Eliminate agent blind spots before they catch up to you.
 
 Free. Runs entirely on your machine. No cloud, no account, no telemetry. Nothing leaves your computer.
 
-Centrol covers the two main paths agents act through, the filesystem and MCP tool calls. Within those, it blocks what violates policy and records everything else to an append-only, hash-chained ledger you can review, verify, and roll back.
+Centrol covers the paths agents act through — the filesystem, MCP tool calls, shell, and outbound network. It logs everything it sees to an append-only, hash-chained ledger you can review, verify, and roll back, and it blocks what violates policy on the path where blocking is possible.
+
+## The proxy is the part that acts
+The record tells you what happened. The proxy is what changes what's allowed to happen.
+It sits between your agent and every MCP server it talks to. Every tool call passes through it before anything executes — that's where allowlists and blocks happen. A call that violates policy doesn't run. It gets recorded as having been refused.
+That's the difference between watching and governing. You decide what's allowed, once. The proxy enforces it on every call, without you being in the loop each time.
+Setup is one command. centrol proxy install <client> rewrites your MCP config so every server launches through the proxy. You run it once. After that it's automatic — no wrapper around your agent, no changes to your servers, nothing to remember before you start a session. It backs up your original config first, and it's safe to re-run: anything already wrapped is left alone.
+What you get day to day:
+•	A gate that runs whether you're watching or not
+•	A record of both what ran and what was refused
+•	The ability to loosen or tighten access without touching your agent or your servers
+•	Nothing left running when you're not — no daemon, no service, no port
+
+## guard is what you run agents under
+There's no reason not to. Guard doesn't slow the agent down, change what it does, or add a step to your workflow — you run the same command with one word in front, and the run is recorded.
+Two things happen when it starts. Every action gets recorded out-of-band — commands, file mutations, tool calls — so there's a record independent of the agent's own. And a snapshot is taken, so whatever the run produces, there's a state to return to.
+When it goes sideways, you have the record of what happened and centrol undo to get back to before it started. When it doesn't, you still have the record — which is the part you'll want three weeks from now when you're trying to remember what an agent actually did.
+Guard and undo are one workflow. Guard takes the snapshot; undo is how you get back to it. Run something under guard and you can reverse it. 
+
+## Undo doesn't mean "revert everything"
+Most rollback tools work the same way: restore the snapshot, lose whatever happened since. That's fine if the only thing that changed was the agent's work. It's a problem if you also touched something while the agent was running.
+Centrol's undo is scoped to what the agent did. Your own work in progress is left alone.
+Here's how it goes. You run the rollback, it confirms the restore succeeded, and then it shows you what the snapshot didn't have — the files and paths that appeared while the agent was running. Those are the ones the rollback couldn't account for, so it doesn't guess. It lists them, and you decide: keep, delete, move, whatever's right for that file.
+Nothing is destroyed on your behalf. The decision stays with you.
+That matters more than it sounds. If undo could silently eat an hour of your own work, you'd never reach for it — which means the agent's changes would just stay there. Undo is only useful if it's safe to run. This one is, because it hands you the list instead of making the call.
+centrol undo --list shows what snapshots exist. centrol undo --from <id> restores a specific one instead of the most recent.
+
 
 ## How it works 
 | Command | What it does |
@@ -119,6 +145,7 @@ back with `centrol undo` afterward.
 | Direct shell         | log   |   -   | not intercepted       |
 | Network (non-MCP)    | log   |   -   | not intercepted       |
 
+
 This is an accountability layer, not a sandbox. It records and reverses
 governed actions. It does not prevent a determined agent from acting
 outside the governed interfaces.
@@ -159,10 +186,7 @@ While the tool is running, any external modification to `.centrol/`
 ledger files is detected and logged as a `policy.tamper_detected`
 event.
 
-Limit: detection works while the tool is running. The free tier does
-not prevent offline modification of a sealed segment. Full
-tamper-resistance — including off-machine anchoring and managed
-verification — is available in the enterprise tier.
+Limit: detection works while the tool is running. 
 
 ## Reference verifier: `centrol-verify`
 
@@ -174,10 +198,7 @@ ledger. The point is that you can check a ledger without trusting, or
 even building, the binary that produced it: two independent
 implementations agreeing is stronger than one checking itself.
 
-It accepts a ledger from any tier. Every Centrol tier writes the same
-event envelope and chain, so a free-tier ledger, an enterprise station
-ledger and an enterprise org ledger all verify the same way.
-
+It accepts a ledger from any tier. 
 ```
 centrol-verify <path-to-lighthouse.jsonl>
 centrol-verify <path-to-.centrol-directory>
