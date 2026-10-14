@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"net/url"
 	"path/filepath"
 	"strings"
 )
@@ -38,6 +39,18 @@ func ServerIdentity(command string, args []string) string {
 		return a
 	}
 	return base // launcher with no identifiable argument; fall back to its own name
+}
+
+// HTTPServerIdentity is the identity of an HTTP target: its URL host,
+// with the port if one is given. An HTTP server has no package or
+// binary name to go by, and the host is what distinguishes one from
+// another. An unparseable URL has no identity, which no policy lists.
+func HTTPServerIdentity(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // MatchesAllowlist reports whether a target is present in the

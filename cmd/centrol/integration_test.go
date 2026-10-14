@@ -1320,6 +1320,68 @@ func TestProxyTargetURLFlagForwardsThroughHTTPTarget(t *testing.T) {
 	}
 }
 
+// runProxyAgainstHTTP runs `centrol proxy` against an HTTP target with
+// HOME pointed at a temp directory holding the given allowlist.json,
+// feeds it the requests, and returns stdout and stderr.
+func runProxyAgainstHTTP(t *testing.T, targetURL, allowlist string, requests ...string) (stdout, stderr string) {
+	t.Helper()
+	dir := initTestRepo(t)
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".centrol"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".centrol", "allowlist.json"), []byte(allowlist), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binPath, "proxy", "--target-url", targetURL)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "HOME="+home, "USERPROFILE="+home)
+	cmd.Stdin = strings.NewReader(strings.Join(requests, "\n") + "\n")
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	_ = cmd.Run() // stdin EOF ends the run; the exit code is asserted by callers that care
+	return outBuf.String(), errBuf.String()
+}
+
+// TestProxyEnforcesTheLocalAllowlistAtCallTime proves the whole chain:
+// the HTTP target's host becomes the server identity, the policy file
+// is found through HOME, and a tool outside the server's list is
+// refused while a listed one reaches the target.
+func TestProxyEnforcesTheLocalAllowlistAtCallTime(t *testing.T) {
+	srv := echoJSONRPCServer(t)
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "http://")
+	allowlist := fmt.Sprintf(`{"servers":[{"server":%q,"tools":["read_file"]}]}`, host)
+
+	stdout, stderr := runProxyAgainstHTTP(t, srv.URL, allowlist,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a.go"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"a.go"}}}`,
+	)
+	if !strings.Contains(stdout, `"ok":true`) {
+		t.Fatalf("expected the listed tool to reach the target, got stdout: %q (stderr: %s)", stdout, stderr)
+	}
+	if !strings.Contains(stdout, `"id":2`) || !strings.Contains(stdout, `"error"`) {
+		t.Fatalf("expected a JSON-RPC denial for the unlisted tool, got stdout: %q (stderr: %s)", stdout, stderr)
+	}
+	if strings.Count(stdout, `"ok":true`) != 1 {
+		t.Fatalf("the unlisted tool must never reach the target, got stdout: %q", stdout)
+	}
+}
+
+func TestProxyRefusesToStartOnAMalformedAllowlist(t *testing.T) {
+	srv := echoJSONRPCServer(t)
+	defer srv.Close()
+	stdout, stderr := runProxyAgainstHTTP(t, srv.URL, `{`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a.go"}}}`)
+	if strings.Contains(stdout, `"ok":true`) {
+		t.Fatalf("a malformed policy must not let the call through, got stdout: %q", stdout)
+	}
+	if !strings.Contains(stderr, "local allowlist") || !strings.Contains(stderr, "allowlist.json") {
+		t.Fatalf("expected the error to name the local allowlist file, got stderr: %s", stderr)
+	}
+}
+
 func TestProxyTargetURLFromConfigIsUsedWhenNoFlagsGiven(t *testing.T) {
 	dir := initTestRepo(t)
 	srv := echoJSONRPCServer(t)

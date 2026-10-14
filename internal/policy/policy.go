@@ -64,12 +64,18 @@ type Contract struct {
 	ExpiresAt      time.Time // zero value means "no explicit expiry set"; the contract is still purged at run end regardless
 
 	// kind=guard
-	AllowedPaths      []string // repo-relative path prefixes the run is scoped to; "." means the whole repo
-	AllowedMCPServers []string // shared with kind=proxy below
+	AllowedPaths []string // repo-relative path prefixes the run is scoped to; "." means the whole repo
 
-	// kind=proxy
-	// AllowedMCPServers is shared with kind=guard above.
-	AllowedToolPatterns []string
+	// kind=proxy — the structured MCP policy in force for this run,
+	// resolved once at startup and filled in by ApplyPolicy. PolicySource
+	// is empty when no structured policy is active, and none of the
+	// fields below is consulted then. Unlike AllowedPaths, nothing
+	// amends these mid-run: an active policy is absolute.
+	PolicySource        string   // source that supplied the policy: SourceEnterprisePolicy or SourceLocalAllowlist
+	ServerIdentity      string   // identity of the one MCP server this proxy fronts
+	AllowedMCPServers   []string // every server the policy permits
+	AllowedToolPatterns []string // tool names permitted for ServerIdentity (exact match); nil means any tool
+	AllowedServerPaths  []string // path patterns permitted for ServerIdentity (see matchPathPattern); nil means any path
 
 	// kind=verify (reserved; nothing constructs a verify contract yet)
 	AllowedDeps   []string
@@ -315,6 +321,11 @@ type ToolCallArgs struct {
 // EvaluateToolCall implements the proxy's three policy tiers for one
 // intercepted MCP tools/call.
 func EvaluateToolCall(args ToolCallArgs, c Contract) (Tier, string) {
+	// First, because whether this server may be called at all is the
+	// more fundamental refusal than anything about its arguments.
+	if tier, reason := evaluateMCPPolicy(args, c); tier != Allow {
+		return tier, reason
+	}
 	if args.ShellChain {
 		return Block, "shell chain in tool args"
 	}

@@ -182,6 +182,31 @@ func cmdProxyRun(args []string) {
 
 	contract := policy.DefaultContract(policy.KindProxy, runID, root)
 	contract.MassMutationThreshold = threshold
+
+	// An active structured MCP policy (enterprise, else the user's own
+	// allowlist.json) is resolved once, here, and carried in the
+	// contract for the whole run. An invalid policy file fails the run
+	// before the target starts, rather than letting it proceed ungoverned.
+	var identity string
+	if useHTTP {
+		identity = policy.HTTPServerIdentity(targetURL)
+	} else {
+		identity = policy.ServerIdentity(fields[0], fields[1:])
+	}
+	var activePolicy *policy.StructuredPolicy
+	if err := runSetup(ctx, end, signalOutcome, func() error {
+		var e error
+		activePolicy, e = resolver.ActivePolicy()
+		return e
+	}); err != nil {
+		end("resolve_mcp_policy_failed", 1, func() {
+			fmt.Fprintf(os.Stderr, "centrol proxy: %v\n", err)
+		})
+		return
+	}
+	if activePolicy != nil {
+		contract.ApplyPolicy(activePolicy, identity)
+	}
 	gc := newGuardedContract(contract)
 	_ = threshSource // available for a future --verbose provenance line; not surfaced by default to keep startup output quiet
 
@@ -216,7 +241,6 @@ func cmdProxyRun(args []string) {
 	// here for the allowlist to match against, so there is nothing for
 	// this step to do for useHTTP.
 	if !useHTTP {
-		identity := policy.ServerIdentity(fields[0], fields[1:])
 		var allowed []string
 		if err := runSetup(ctx, end, signalOutcome, func() error {
 			var e error

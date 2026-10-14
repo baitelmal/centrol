@@ -77,6 +77,31 @@ func TestAllowedToolCallForwardsUnchanged(t *testing.T) {
 	}
 }
 
+func TestStructuredPolicyBlocksAnUnlistedToolWithoutForwarding(t *testing.T) {
+	rec := &recorder{}
+	c := testContract()
+	c.ApplyPolicy(&policy.StructuredPolicy{
+		Source:  policy.SourceEnterprisePolicy,
+		Servers: []policy.PolicyServer{{Server: "fs", Tools: []string{"read_file"}}},
+	}, "fs")
+	in := NewInterceptor("run-1", c, rec.emit, nil, true)
+
+	forward, _, block, err := in.HandleClientRequest(toolCallLine(t, "1", "write_file", map[string]interface{}{"path": "src/a.go"}))
+	if err != nil {
+		t.Fatalf("HandleClientRequest: %v", err)
+	}
+	if forward || block == nil {
+		t.Fatalf("expected the call blocked with a denial response, got forward=%v block=%s", forward, block)
+	}
+	if !rec.has("tool.blocked") {
+		t.Fatal("expected tool.blocked to be recorded")
+	}
+	forward, _, _, _ = in.HandleClientRequest(toolCallLine(t, "2", "read_file", map[string]interface{}{"path": "src/a.go"}))
+	if !forward {
+		t.Fatal("expected the listed tool forwarded")
+	}
+}
+
 func TestHardBlockNeverForwardsToTarget(t *testing.T) {
 	rec := &recorder{}
 	in := NewInterceptor("run-1", testContract(), rec.emit, nil, true)
