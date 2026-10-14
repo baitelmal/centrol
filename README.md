@@ -468,8 +468,9 @@ directly by the agent process never passes through the proxy, so it
 cannot be refused; `centrol guard` watches the three files and records
 the write as a block-tier `policy.violation` instead. To do that, guard
 creates `~/.centrol` (mode 0700) if it is missing. The repo's own
-`.centrol/config.toml` is not covered: the guard excludes the repo's
-`.centrol` directory because the ledger lives there.
+`.centrol/config.toml` is covered the same way. The guard excludes the
+repo's `.centrol` directory because the ledger lives there, so that one
+file is watched individually; the ledger is still excluded.
 
 If the home directory cannot be determined, no policy file is looked for
 and the flat `config.toml` allowlist applies; this keeps minimal
@@ -511,6 +512,16 @@ regardless. Use it to see what a stricter policy *would* have done
 before turning it on for real. `centrol audit` renders these with a
 distinct `◇` (ASCII fallback `o`) so an observe run's ledger is never
 mistaken for an enforced one.
+
+`observe_mode` is read once at startup, not per tool call, so changing
+it in a config file takes effect the next time `centrol proxy` or
+`centrol guard` launches (MCP clients launch a fresh proxy per session).
+Because `observe_mode = true` turns off blocking, treat any change to it
+in `<repo>/.centrol/config.toml` as a security event; centrol protects
+that file and records a direct write to it. The same file's
+`proxy.allowed_servers`, `proxy.additional_block_paths`,
+`proxy.target_url`, `proxy.strict_matching`, `gate.allow_session_amend`
+and `proxy.mass_mutation_threshold` can also loosen enforcement.
 
 ## Policy denials
 

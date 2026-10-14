@@ -52,9 +52,33 @@
   sees tool calls only; it is detected. `centrol guard` creates
   `~/.centrol` (mode 0700) if it does not exist, so a policy file created
   from nothing is seen too
-- The repo's own `.centrol/config.toml` is still not watched: the guard
-  excludes the repo's `.centrol` directory unconditionally, because the
-  ledger lives there
+- The repo's own `.centrol/config.toml` is protected and watched the
+  same way. It outranks the user config, and the guard excludes the
+  repo's `.centrol` directory because the ledger lives there, so the
+  file is carved out individually: its directory is watched without
+  recursion and only events for that file are reported. Ledger segments
+  (`lighthouse.jsonl`, `lighthouse.NNN.jsonl`) and everything else in
+  the directory stay excluded, so the ledger writing to itself produces
+  no events
+- Config is read once, when `centrol proxy` or `centrol guard` starts,
+  never per tool call. That includes `general.observe_mode`: a write to
+  the repo config takes effect the next time centrol launches, not
+  mid-run. MCP clients start a fresh proxy per session, so a changed
+  file applies from the next session. This is why a write is a
+  detection and review matter rather than an immediate bypass
+- Keys in the repo `config.toml` that can weaken enforcement if an
+  agent writes them, now covered by the protection above:
+  `general.observe_mode = true` (evaluates, logs, never blocks),
+  `proxy.allowed_servers` (the server allowlist when no policy file is
+  active), `proxy.additional_block_paths` (the repo list replaces the
+  user list, so `[]` drops extra blocks; the built-in protected set is
+  not affected), `proxy.target_url` (an HTTP target skips the launch-time
+  allowlist check), `proxy.strict_matching = false`,
+  `gate.allow_session_amend = true`, and `proxy.mass_mutation_threshold`
+  (raised up to 1000). `guard.watcher_debounce_ms` has no upper bound and
+  is a minor lever. `gate.prompt_timeout_seconds` (floor 30), the
+  timeout and retry keys and `general.log_level` cannot weaken
+  enforcement. An active policy file still overrides the allowlist keys
 
 ### Notes
 
