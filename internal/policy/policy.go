@@ -74,7 +74,7 @@ type Contract struct {
 	PolicySource        string   // source that supplied the policy: SourceEnterprisePolicy or SourceLocalAllowlist
 	ServerIdentity      string   // identity of the one MCP server this proxy fronts
 	AllowedMCPServers   []string // every server the policy permits
-	AllowedToolPatterns []string // tool names permitted for ServerIdentity (exact match); nil means any tool
+	AllowedToolPatterns []string // tool names permitted for ServerIdentity; nil means any tool. Exact names, not patterns: the name is kept from the declared contract shape
 	AllowedServerPaths  []string // path patterns permitted for ServerIdentity (see matchPathPattern); nil means any path
 
 	// kind=verify (reserved; nothing constructs a verify contract yet)

@@ -345,6 +345,10 @@ is used if set.
 - **Redirects** — same-host redirects are followed, up to 3; any
   cross-host or cross-scheme redirect is refused outright, so a
   session's credentials are never sent to a different host.
+- **Policy identity** — an HTTP target has no package or binary name, so
+  an [MCP policy file](#mcp-policy-files) matches it by its URL host,
+  with the port if the URL has one (`mcp.example.com`,
+  `127.0.0.1:8080`).
 
 ## Config (`.centrol/config.toml` or `~/.centrol/config.toml`)
 
@@ -456,6 +460,16 @@ server name, or trailing content is an error. The consequence for
 releases is that a field added to the enterprise policy file in a later
 version fails closed on an older centrol until it is upgraded, so the
 two tiers need to be upgraded together.
+
+**The policy files are protected.** `enterprise-policy.json`,
+`allowlist.json` and `~/.centrol/config.toml` are in centrol's built-in
+protected set: an MCP tool call that names one is refused. A write made
+directly by the agent process never passes through the proxy, so it
+cannot be refused; `centrol guard` watches the three files and records
+the write as a block-tier `policy.violation` instead. To do that, guard
+creates `~/.centrol` (mode 0700) if it is missing. The repo's own
+`.centrol/config.toml` is not covered: the guard excludes the repo's
+`.centrol` directory because the ledger lives there.
 
 If the home directory cannot be determined, no policy file is looked for
 and the flat `config.toml` allowlist applies; this keeps minimal

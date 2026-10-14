@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.4.0 — 2026-10-14
+
+### Added
+
+- Structured MCP policy: `~/.centrol/allowlist.json` (yours) and
+  `~/.centrol/enterprise-policy.json` (written by the enterprise tier).
+  Both list the MCP servers allowed and, per server, the tools it may be
+  called with (`tools`) and the paths its calls may touch (`paths`, with
+  `*` and `**` globs). Absent `tools`/`paths` mean unrestricted; an empty
+  list means nothing is allowed. If the enterprise file exists it is the
+  policy, else `allowlist.json`, else `config.toml`'s `allowed_servers`
+  as before. An active policy is absolute: its server list is the
+  allowlist and `config.toml`'s list is ignored
+- Call-time enforcement: with a policy active, `centrol proxy` refuses a
+  tool call to an unlisted server, an unlisted tool, or a path outside
+  the server's `paths`, before the existing checks run. Policies only
+  narrow what centrol already allows; they cannot grant a path the repo
+  scope or the protected paths refuse
+- The enterprise policy's values show as locked in `centrol config`; the
+  provenance name `local_allowlist` is new alongside `enterprise_policy`
+- An HTTP target's identity for policy matching is its URL host, with
+  the port if given
+
+### Changed
+
+- With a policy active, an unlisted server is refused at launch with no
+  prompt, and the message says whose policy it is and where to add the
+  server ("Add to allowlist" would write a `config.toml` the policy
+  shadows). `centrol config` likewise points at the file instead of
+  offering to add a server. With no policy file, the prompt is
+  unchanged
+- A policy file that exists but cannot be read or parsed fails closed:
+  centrol stops with an error naming the file rather than falling back
+  to a more permissive source. The parser is strict (unknown fields are
+  errors), so a field added by a later enterprise release fails closed
+  on an older centrol until it is upgraded
+- `Contract.AllowedToolPatterns`, declared since v0.1 and never used, now
+  carries the policy's `tools` for the server being fronted. Despite the
+  name, entries are exact tool names, not patterns; the name is kept
+  from the declared contract shape
+
+### Security
+
+- The files that decide what the agent may do are now protected:
+  `~/.centrol/enterprise-policy.json`, `allowlist.json` and
+  `config.toml` are in the built-in protected set, so an MCP tool call
+  that names one is refused, and `centrol guard` watches them, so a
+  direct write by the agent process is recorded as a block-tier
+  `policy.violation`. A direct write cannot be refused, because the proxy
+  sees tool calls only; it is detected. `centrol guard` creates
+  `~/.centrol` (mode 0700) if it does not exist, so a policy file created
+  from nothing is seen too
+- The repo's own `.centrol/config.toml` is still not watched: the guard
+  excludes the repo's `.centrol` directory unconditionally, because the
+  ledger lives there
+
+### Notes
+
+- With no `HOME`, no policy file is looked for and the flat
+  `config.toml` allowlist applies, so minimal containers keep working
+- `tools/list` is not filtered; a tool outside the policy still appears
+  to the client and is refused when called
+
 ## v0.3.0 — 2026-10-07
 
 ### Added
