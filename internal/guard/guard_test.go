@@ -997,3 +997,147 @@ func TestCheckedEmitEscalatesAfterThreeConsecutiveFailures(t *testing.T) {
 		t.Fatalf("expected the streak to have reset after escalating, got %v", got)
 	}
 }
+
+// externalRecorder collects emitted events on a channel so a test can
+// wait for exactly the events it expects instead of sleeping.
+func externalRecorder() (EmitFunc, chan string) {
+	events := make(chan string, 64)
+	return func(run, src, typ string, payload map[string]interface{}) error {
+		events <- typ + ":" + payload["path"].(string)
+		return nil
+	}, events
+}
+
+// drain returns every event that arrives until quiet has passed with
+// none, which is how a test proves something was NOT emitted.
+func drain(events chan string, quiet time.Duration) []string {
+	var got []string
+	for {
+		select {
+		case e := <-events:
+			got = append(got, e)
+		case <-time.After(quiet):
+			return got
+		}
+	}
+}
+
+func resolvedTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// A direct write to a watched policy file outside the repo is observed
+// and recorded with its absolute path; other files beside it, and the
+// config writer's own atomic temp file, are not reported.
+func TestWatchExternalFilesObservesOnlyTheListedFiles(t *testing.T) {
+	repo := initRepo(t)
+	home := resolvedTempDir(t)
+	dir := filepath.Join(home, ".centrol") // does not exist yet: the watcher creates it
+	files := []string{filepath.Join(dir, "enterprise-policy.json"), filepath.Join(dir, "allowlist.json"), filepath.Join(dir, "config.toml")}
+
+	emit, events := externalRecorder()
+	ignore, err := LoadIgnore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(repo, "run-1", ignore, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.WatchExternalFiles(files); err != nil {
+		t.Fatalf("WatchExternalFiles: %v", err)
+	}
+	go w.Run()
+
+	for _, f := range files[:2] {
+		if err := os.WriteFile(f, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The way an atomic config writer replaces a file: temp, then rename.
+	tmp := filepath.Join(dir, "config.toml.123.tmp")
+	if err := os.WriteFile(tmp, []byte("[proxy]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, files[2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "unrelated.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]bool{}
+	for _, e := range drain(events, 300*time.Millisecond) {
+		seen[e] = true
+		if !strings.Contains(e, files[0]) && !strings.Contains(e, files[1]) && !strings.Contains(e, files[2]) {
+			t.Errorf("reported an event for something other than the listed files: %s", e)
+		}
+		if strings.Contains(e, "symlink escape") {
+			t.Errorf("an external file must not be treated as a symlink escape: %s", e)
+		}
+	}
+	for _, f := range files {
+		if !seen["fs.create:"+f] && !seen["fs.write:"+f] {
+			t.Errorf("no fs.create or fs.write event for %s; saw %v", f, seen)
+		}
+	}
+}
+
+// If the repo root is the home directory, ~/.centrol is also the repo's
+// own hard-excluded .centrol; the policy files must still be seen.
+func TestWatchExternalFilesWorksWhenTheRepoIsTheHomeDirectory(t *testing.T) {
+	home := resolvedTempDir(t)
+	file := filepath.Join(home, ".centrol", "allowlist.json")
+
+	emit, events := externalRecorder()
+	ignore, err := LoadIgnore(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(home, "run-1", ignore, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.WatchExternalFiles([]string{file}); err != nil {
+		t.Fatal(err)
+	}
+	go w.Run()
+
+	if err := os.WriteFile(file, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The repo's own ledger directory is still excluded.
+	if err := os.WriteFile(filepath.Join(home, ".centrol", "lighthouse.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range drain(events, 300*time.Millisecond) {
+		if strings.Contains(e, "lighthouse.jsonl") {
+			t.Errorf("the ledger must stay excluded: %s", e)
+		}
+		if e == "fs.create:"+file || e == "fs.write:"+file {
+			return
+		}
+	}
+	t.Fatalf("no event for %s with the repo root at the home directory", file)
+}
+
+func TestWatchExternalFilesWithNothingToWatchIsANoOp(t *testing.T) {
+	repo := initRepo(t)
+	emit, _ := externalRecorder()
+	ignore, _ := LoadIgnore(repo)
+	w, err := NewWatcher(repo, "run-1", ignore, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.WatchExternalFiles(nil); err != nil {
+		t.Fatalf("WatchExternalFiles(nil) = %v, want nil", err)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -99,6 +100,34 @@ func TestStructuredPolicyBlocksAnUnlistedToolWithoutForwarding(t *testing.T) {
 	forward, _, _, _ = in.HandleClientRequest(toolCallLine(t, "2", "read_file", map[string]interface{}{"path": "src/a.go"}))
 	if !forward {
 		t.Fatal("expected the listed tool forwarded")
+	}
+}
+
+func TestToolCallWritingAPolicyFileNeverReachesTheTarget(t *testing.T) {
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	rec := &recorder{}
+	// The repo root is the home directory so ~/.centrol is inside the
+	// repo; otherwise the outside-the-repo rule would refuse the call
+	// for its own reason.
+	in := NewInterceptor("run-1", policy.DefaultContract(policy.KindProxy, "run-1", home), rec.emit, nil, true)
+
+	for _, name := range []string{"enterprise-policy.json", "allowlist.json", "config.toml"} {
+		path := filepath.Join(home, ".centrol", name)
+		forward, _, block, err := in.HandleClientRequest(toolCallLine(t, "1", "write_file", map[string]interface{}{"path": path, "content": "{}"}))
+		if err != nil {
+			t.Fatalf("HandleClientRequest(%s): %v", name, err)
+		}
+		if forward || block == nil {
+			t.Errorf("a tool call writing %s must be refused, got forward=%v", name, forward)
+		}
+	}
+	if !rec.has("tool.blocked") {
+		t.Fatal("expected tool.blocked to be recorded")
 	}
 }
 

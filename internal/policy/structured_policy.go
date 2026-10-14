@@ -164,3 +164,26 @@ func centrolHomeFile(name string) string {
 	}
 	return filepath.Join(home, ".centrol", name)
 }
+
+// userConfigFile is the user-level config.toml, beside the policy files.
+const userConfigFile = "config.toml"
+
+// UserConfigPath is ~/.centrol/config.toml, or "" when the home
+// directory cannot be resolved.
+func UserConfigPath() string { return centrolHomeFile(userConfigFile) }
+
+// TrustedHomeFiles are the files under ~/.centrol that decide what the
+// agent may do: the enterprise policy, the user's own allowlist and the
+// user config. They are the contents of the default protected set (an
+// MCP call to one is refused) and what the guard watches (a direct
+// write is recorded). Nothing here is user-tunable. It is empty when
+// the home directory cannot be resolved.
+func TrustedHomeFiles() []string {
+	var files []string
+	for _, name := range []string{enterprisePolicyFile, localAllowlistFile, userConfigFile} {
+		if path := centrolHomeFile(name); path != "" {
+			files = append(files, path)
+		}
+	}
+	return files
+}

@@ -106,11 +106,7 @@ func tamperDetectionEmit(root, runID, src string, emit func(run, src, typ string
 }
 
 func userConfigPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "" // resolved to a LocalFileSource that will just never find/write anything usable; not fatal on its own
-	}
-	return filepath.Join(home, ".centrol", "config.toml")
+	return policy.UserConfigPath() // "" without a home directory resolves to a LocalFileSource that never finds or writes anything usable; not fatal on its own
 }
 
 func repoConfigPath(root string) string {

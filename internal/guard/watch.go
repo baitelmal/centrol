@@ -73,6 +73,7 @@ type Watcher struct {
 	runID    string
 	ignore   *IgnoreSet
 	fsw      *fsnotify.Watcher
+	external map[string]bool // absolute files outside the repo that are observed too; see WatchExternalFiles
 	emit     EmitFunc
 	debounce time.Duration // guard.watcher_debounce_ms, resolved by the caller; 0 disables coalescing entirely
 
@@ -182,13 +183,87 @@ func NewWatcherWithDebounce(repoRoot, runID string, ignore *IgnoreSet, emit Emit
 	}
 	w := &Watcher{
 		repoRoot: repoRoot, runID: runID, ignore: ignore, fsw: fsw, emit: emit,
-		debounce: debounce, pending: map[string]*pendingFSEvent{},
+		debounce: debounce, pending: map[string]*pendingFSEvent{}, external: map[string]bool{},
 	}
 	if err := w.addRecursive(repoRoot); err != nil {
 		fsw.Close()
 		return nil, err
 	}
 	return w, nil
+}
+
+// WatchExternalFiles observes specific files outside the repo — the
+// policy files under ~/.centrol, which decide what the agent may do.
+// fsnotify watches directories, so each file's parent directory is
+// watched, and only events for the listed files are reported: anything
+// else that lands in that directory (including this tool's own atomic
+// temp files) is ignored. A parent directory that does not exist yet is
+// created (0700, as the config writer would), because an agent creating
+// a policy file in a directory that was not there at startup is the
+// case most worth seeing.
+//
+// This is detection, not prevention. A direct write by the agent
+// process never passes through the proxy, which sees tool calls only,
+// so it cannot be refused here; it is recorded as an fs.* event with the
+// absolute path, and the protected-path check turns that into a
+// policy.violation.
+func (w *Watcher) WatchExternalFiles(files []string) error {
+	for _, f := range files {
+		f = filepath.Clean(f)
+		dir := filepath.Dir(f)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("watching %s: %w", f, err)
+		}
+		if err := w.fsw.Add(dir); err != nil {
+			return fmt.Errorf("watching %s: %w", f, err)
+		}
+		w.external[f] = true
+	}
+	return nil
+}
+
+// externalEvent reports whether ev belongs to the external file watch
+// and, if so, handles it. Events for other files in a watched external
+// directory are consumed and dropped. It runs before every repo rule
+// because those rules are about paths inside the repo root: applied to
+// a path outside it they would misreport it as a symlink escape, and if
+// the repo root is the home directory, the repo's hard .centrol
+// exclusion would otherwise swallow the very files being watched.
+func (w *Watcher) externalEvent(ev fsnotify.Event) bool {
+	if len(w.external) == 0 {
+		return false
+	}
+	abs := filepath.Clean(ev.Name)
+	if !w.external[abs] {
+		for f := range w.external {
+			if filepath.Dir(f) == filepath.Dir(abs) {
+				return true
+			}
+		}
+		return false
+	}
+	typ := fsEventType(ev)
+	if typ == "" {
+		return true
+	}
+	w.emitDebounced(typ, abs, map[string]interface{}{"path": filepath.ToSlash(abs)})
+	return true
+}
+
+// fsEventType maps an fsnotify op to the ledger event type, or "" for
+// an op that is not recorded.
+func fsEventType(ev fsnotify.Event) string {
+	switch {
+	case ev.Op&fsnotify.Create != 0:
+		return "fs.create"
+	case ev.Op&fsnotify.Remove != 0:
+		return "fs.delete"
+	case ev.Op&fsnotify.Write != 0:
+		return "fs.write"
+	case ev.Op&fsnotify.Rename != 0:
+		return "fs.delete" // the old name stops existing; the new name arrives as its own Create
+	}
+	return ""
 }
 
 func (w *Watcher) addRecursive(root string) error {
@@ -383,6 +458,9 @@ func (w *Watcher) Run() {
 }
 
 func (w *Watcher) handle(ev fsnotify.Event) {
+	if w.externalEvent(ev) {
+		return
+	}
 	absPath := ev.Name
 
 	// MANDATORY, unconditional, before anything else.
@@ -433,17 +511,8 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 		}
 	}
 
-	var typ string
-	switch {
-	case ev.Op&fsnotify.Create != 0:
-		typ = "fs.create"
-	case ev.Op&fsnotify.Remove != 0:
-		typ = "fs.delete"
-	case ev.Op&fsnotify.Write != 0:
-		typ = "fs.write"
-	case ev.Op&fsnotify.Rename != 0:
-		typ = "fs.delete" // the old name stops existing; the new name arrives as its own Create
-	default:
+	typ := fsEventType(ev)
+	if typ == "" {
 		return
 	}
 

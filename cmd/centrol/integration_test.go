@@ -1575,6 +1575,38 @@ func TestGuardEnforcesAdditionalBlockPaths(t *testing.T) {
 	}
 }
 
+// TestGuardRecordsADirectWriteToAPolicyFile is the detection half of
+// protecting the policy files. The write bypasses the proxy entirely, so
+// nothing can refuse it; the guard must see it and record it as a
+// block-tier violation naming the file.
+func TestGuardRecordsADirectWriteToAPolicyFile(t *testing.T) {
+	dir := initTestRepo(t)
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, ".centrol", "allowlist.json")
+
+	cmd := exec.Command(binPath, "guard", "--", "sh", "-c", fmt.Sprintf("echo '{\"servers\":[]}' > %s", target))
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "HOME="+home, "USERPROFILE="+home)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("guard failed: %v\n%s", err, out)
+	}
+
+	ledgerData, err := os.ReadFile(filepath.Join(dir, ".centrol", "lighthouse.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := string(ledgerData)
+	if !strings.Contains(ledger, `"type":"policy.violation"`) || !strings.Contains(ledger, `"path":"`+target+`"`) {
+		t.Fatalf("expected a policy.violation naming %s, got ledger:\n%s", target, ledger)
+	}
+	if !strings.Contains(ledger, `"tier":"block"`) {
+		t.Fatalf("expected a block-tier violation for a protected policy file, got ledger:\n%s", ledger)
+	}
+}
+
 func TestProxyTargetFlagOverridesConfiguredTargetURL(t *testing.T) {
 	dir := initTestRepo(t)
 

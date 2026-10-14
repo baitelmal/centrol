@@ -117,6 +117,8 @@ func defaultProtectedPaths() []string {
 		// substring guard even if it can't be resolved on this host.
 		paths = append(paths, "~/.ssh", "~/.aws")
 	}
+	// Anything the tool reads and trusts is protected (DEVELOPMENT.md).
+	paths = append(paths, TrustedHomeFiles()...)
 	return CanonicalizeBlockPaths(paths)
 }
 
