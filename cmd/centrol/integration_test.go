@@ -1607,6 +1607,41 @@ func TestGuardRecordsADirectWriteToAPolicyFile(t *testing.T) {
 	}
 }
 
+// TestGuardRecordsADirectWriteToTheSignedPolicyFiles covers the two files
+// that make the enterprise policy verifiable. Overwriting either one is
+// inert on its own, but it is exactly the move a coordinated tamper
+// starts with, so each write must be seen and recorded.
+func TestGuardRecordsADirectWriteToTheSignedPolicyFiles(t *testing.T) {
+	for _, name := range []string{"enterprise-pubkey", "enterprise-policy.verified.json"} {
+		t.Run(name, func(t *testing.T) {
+			dir := initTestRepo(t)
+			home, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(home, ".centrol", name)
+
+			cmd := exec.Command(binPath, "guard", "--", "sh", "-c", fmt.Sprintf("echo x > %s", target))
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(), "HOME="+home, "USERPROFILE="+home)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("guard failed: %v\n%s", err, out)
+			}
+			ledgerData, err := os.ReadFile(filepath.Join(dir, ".centrol", "lighthouse.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ledger := string(ledgerData)
+			if !strings.Contains(ledger, `"type":"fs.`) || !strings.Contains(ledger, `"path":"`+target+`"`) {
+				t.Fatalf("expected an fs.* event naming %s, got ledger:\n%s", target, ledger)
+			}
+			if !strings.Contains(ledger, `"type":"policy.violation"`) || !strings.Contains(ledger, `"tier":"block"`) {
+				t.Fatalf("expected a block-tier policy.violation, got ledger:\n%s", ledger)
+			}
+		})
+	}
+}
+
 // TestGuardRecordsADirectWriteToTheRepoConfig is the repo-config twin of
 // the home-file test: the file sits in the .centrol directory the repo
 // watch excludes, so it is watched individually. The same run proves the

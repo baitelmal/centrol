@@ -22,9 +22,9 @@ func trustedHome(t *testing.T) string {
 	return home
 }
 
-var trustedNames = []string{"enterprise-policy.json", "allowlist.json", "config.toml"}
+var trustedNames = []string{"enterprise-policy.json", "enterprise-pubkey", "enterprise-policy.verified.json", "allowlist.json", "config.toml"}
 
-func TestTrustedFilesAreExactlyTheThreeInHome(t *testing.T) {
+func TestTrustedFilesAreExactlyTheFiveInHome(t *testing.T) {
 	home := trustedHome(t)
 	var want []string
 	for _, n := range trustedNames {
@@ -39,8 +39,8 @@ func TestTrustedFilesAreExactlyTheThreeInHome(t *testing.T) {
 			t.Errorf("TrustedFiles[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
-	if p := UserConfigPath(); p != want[2] {
-		t.Errorf("UserConfigPath = %q, want %q", p, want[2])
+	if p := UserConfigPath(); p != want[len(want)-1] {
+		t.Errorf("UserConfigPath = %q, want %q", p, want[len(want)-1])
 	}
 }
 
@@ -86,7 +86,7 @@ func TestToolCallsToThePolicyFilesAreBlocked(t *testing.T) {
 	}
 }
 
-// Only the three files are protected. Another file in ~/.centrol, or a
+// Only the trusted files are protected. Another file in ~/.centrol, or a
 // near-miss name beside a policy file, is not blocked by this set (the
 // repo root is the home directory, so that no other rule applies).
 func TestOtherFilesUnderCentrolHomeAreNotBlocked(t *testing.T) {
@@ -95,7 +95,7 @@ func TestOtherFilesUnderCentrolHomeAreNotBlocked(t *testing.T) {
 	for _, name := range []string{"notes.txt", "allowlist.json.bak", "config.toml.old", "enterprise-policy.json.tmp"} {
 		path := filepath.Join(home, ".centrol", name)
 		if tier, reason := EvaluateToolCall(ToolCallArgs{ToolName: "write_file", PathArgs: []string{path}}, c); tier == Block {
-			t.Errorf("write to %q was blocked (%q); only the three policy files are protected", path, reason)
+			t.Errorf("write to %q was blocked (%q); only the listed trusted files are protected", path, reason)
 		}
 	}
 }
@@ -164,6 +164,8 @@ func TestTrustedFilesIncludeTheRepoConfigAndKeepTheHomeFiles(t *testing.T) {
 	got := TrustedFiles(repo)
 	want := []string{
 		filepath.Join(home, ".centrol", "enterprise-policy.json"),
+		filepath.Join(home, ".centrol", "enterprise-pubkey"),
+		filepath.Join(home, ".centrol", "enterprise-policy.verified.json"),
 		filepath.Join(home, ".centrol", "allowlist.json"),
 		filepath.Join(home, ".centrol", "config.toml"),
 		filepath.Join(repo, ".centrol", "config.toml"),
@@ -176,8 +178,8 @@ func TestTrustedFilesIncludeTheRepoConfigAndKeepTheHomeFiles(t *testing.T) {
 			t.Errorf("TrustedFiles[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
-	if RepoConfigPath(repo) != want[3] {
-		t.Errorf("RepoConfigPath = %q, want %q", RepoConfigPath(repo), want[3])
+	if RepoConfigPath(repo) != want[len(want)-1] {
+		t.Errorf("RepoConfigPath = %q, want %q", RepoConfigPath(repo), want[len(want)-1])
 	}
 }
 

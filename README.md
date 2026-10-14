@@ -461,11 +461,40 @@ releases is that a field added to the enterprise policy file in a later
 version fails closed on an older centrol until it is upgraded, so the
 two tiers need to be upgraded together.
 
+**The enterprise policy is signed.** The enterprise tier signs
+`enterprise-policy.json` with its Meta-ARK key (a top-level `"signature"`,
+base64 ed25519, over the canonical JSON of the file without that field:
+keys sorted, no whitespace, so key order and layout do not matter).
+If `~/.centrol/enterprise-pubkey` (the Meta-ARK public key, base64) is
+present, centrol verifies the policy against it on every load, and each
+policy that verifies is copied to
+`~/.centrol/enterprise-policy.verified.json`. A policy that does not
+verify (an edit, a bad signature, the wrong key) does not lock the
+station out: centrol keeps using the last verified policy, which is
+always the most recent valid push, so a single tamper changes nothing.
+Only when that copy is also missing or invalid does it fail closed, with
+an error that names both files. If the pubkey is present but no policy
+has ever been pushed, no servers are permitted.
+
+The pubkey arrives together with the first policy, not at enrollment, so
+an enrolled station with nothing pushed yet stays on its solo behavior
+and the change to enterprise-managed is atomic. With no pubkey there is
+no signature requirement and nothing about `allowlist.json` changes.
+A file carrying a `"signature"` with no pubkey beside it is an error,
+not a policy read on trust.
+
+This is detection and layering, not prevention. An agent running as the
+same user can overwrite the policy, the pubkey and the verified copy.
+Each overwrite is recorded (below); a single one is inert; a coordinated
+tamper needs all three written consistently, and each write is in the
+ledger, so the intent is unmistakable. Preventing it takes sandboxing.
+
 **The policy files are protected.** `enterprise-policy.json`,
-`allowlist.json` and `~/.centrol/config.toml` are in centrol's built-in
+`enterprise-pubkey`, `enterprise-policy.verified.json`, `allowlist.json`
+and `~/.centrol/config.toml` are in centrol's built-in
 protected set: an MCP tool call that names one is refused. A write made
 directly by the agent process never passes through the proxy, so it
-cannot be refused; `centrol guard` watches the three files and records
+cannot be refused; `centrol guard` watches the five files and records
 the write as a block-tier `policy.violation` instead. To do that, guard
 creates `~/.centrol` (mode 0700) if it is missing. The repo's own
 `.centrol/config.toml` is covered the same way. The guard excludes the

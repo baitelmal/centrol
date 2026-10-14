@@ -84,6 +84,13 @@ ledger is; config and policy files were not. When adding a new file
 the runtime reads and acts on, add it to ProtectedPaths and, if it
 lives outside the repo, to the guard's watch set.
 
+A trusted file that carries authority from above (the enterprise
+policy) is signed and verified against a pinned key, not loaded on
+trust. A signed artifact keeps a last-verified copy to fall back to, so
+a single tamper is inert rather than a lockout; fail closed only when
+that copy is also gone or invalid. The key and the copy are trusted
+files too. A same-user overwrite is recorded, not prevented.
+
 ## MCP allowlist sources
 
 The free-tier structured policy files (`~/.centrol/enterprise-policy.json`,

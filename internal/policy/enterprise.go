@@ -19,5 +19,5 @@ func NewEnterpriseSource() *EnterpriseSource {
 // NewEnterpriseSourceAt reads the policy from path instead of the
 // default location. An empty path never finds a file.
 func NewEnterpriseSourceAt(path string) *EnterpriseSource {
-	return &EnterpriseSource{policyFile{name: SourceEnterprisePolicy, label: "enterprise policy", path: path}}
+	return &EnterpriseSource{policyFile{name: SourceEnterprisePolicy, label: "enterprise policy", path: path, signed: signedPolicyBeside(path)}}
 }

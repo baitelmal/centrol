@@ -23,6 +23,21 @@
 - An HTTP target's identity for policy matching is its URL host, with
   the port if given
 
+- Signed enterprise policy. `enterprise-policy.json` carries a
+  top-level `"signature"` (base64 ed25519 over the canonical JSON of the
+  file without it). With a pinned `~/.centrol/enterprise-pubkey` present
+  it is verified on load, and each verified policy is copied to
+  `~/.centrol/enterprise-policy.verified.json`. A policy that fails
+  verification does not lock the station out: the last verified policy
+  stays in force, so a single tamper is inert. Fail-closed only when
+  that copy is also missing or invalid (the error names both files); a
+  pubkey with no policy ever pushed permits no servers. The pubkey
+  arrives with the first policy, not at enrollment, so solo to managed is
+  atomic. With no pubkey nothing changes, and `allowlist.json` is
+  untouched. Same-user tampering is recorded, not prevented: all three
+  files can be overwritten, a coordinated overwrite is visible in the
+  ledger, and prevention is sandboxing
+
 ### Changed
 
 - With a policy active, an unlisted server is refused at launch with no
@@ -44,7 +59,8 @@
 ### Security
 
 - The files that decide what the agent may do are now protected:
-  `~/.centrol/enterprise-policy.json`, `allowlist.json` and
+  `~/.centrol/enterprise-policy.json`, `enterprise-pubkey`,
+  `enterprise-policy.verified.json`, `allowlist.json` and
   `config.toml` are in the built-in protected set, so an MCP tool call
   that names one is refused, and `centrol guard` watches them, so a
   direct write by the agent process is recorded as a block-tier

@@ -76,9 +76,10 @@ func (r *Resolver) ActivePolicy() (*StructuredPolicy, error) {
 // fails closed: every Resolve returns an error, so no lower, more
 // permissive source can answer in its place.
 type policyFile struct {
-	name  string // the Name() of the source, for provenance
-	label string // how errors refer to the file, e.g. "enterprise policy"
-	path  string
+	name   string // the Name() of the source, for provenance
+	label  string // how errors refer to the file, e.g. "enterprise policy"
+	path   string
+	signed *signedPolicy // non-nil for the enterprise policy, which may be signed
 }
 
 func (f policyFile) Name() string { return f.name }
@@ -90,6 +91,11 @@ func (f policyFile) Writable() bool { return false }
 func (f policyFile) Policy() (*StructuredPolicy, error) {
 	if f.path == "" {
 		return nil, nil
+	}
+	if f.signed != nil {
+		if p, err := f.signed.load(f); p != nil || err != nil {
+			return p, err
+		}
 	}
 	data, err := os.ReadFile(f.path)
 	if os.IsNotExist(err) {
@@ -179,8 +185,9 @@ func RepoConfigPath(repoRoot string) string {
 }
 
 // TrustedFiles are the files that decide what the agent may do: the
-// enterprise policy, the user's own allowlist and the user config under
-// ~/.centrol, and the repo's own config, which outranks the user config.
+// enterprise policy with its pinned pubkey and last-verified copy, the
+// user's own allowlist and the user config under ~/.centrol, and the
+// repo's own config, which outranks the user config.
 // They are the trusted part of the default protected set (an MCP call to
 // one is refused) and what the guard watches (a direct write is
 // recorded). Nothing here is user-tunable. The home files are absent
@@ -188,7 +195,7 @@ func RepoConfigPath(repoRoot string) string {
 // repoRoot is empty.
 func TrustedFiles(repoRoot string) []string {
 	var files []string
-	for _, name := range []string{enterprisePolicyFile, localAllowlistFile, configFileName} {
+	for _, name := range []string{enterprisePolicyFile, enterprisePubkeyFile, enterpriseVerifiedFile, localAllowlistFile, configFileName} {
 		if path := centrolHomeFile(name); path != "" {
 			files = append(files, path)
 		}
