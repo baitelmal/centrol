@@ -8,15 +8,6 @@ import (
 	"testing"
 )
 
-func writeEnterprisePolicy(t *testing.T, content string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "enterprise-policy.json")
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
 const scopedPolicy = `{
   "servers": [
     {"server": "server-filesystem", "paths": ["src/**", "docs/**"], "tools": ["read_file", "list_directory"]},
@@ -25,7 +16,7 @@ const scopedPolicy = `{
 }`
 
 func TestEnterpriseSourceIdentity(t *testing.T) {
-	e := NewEnterpriseSourceAt(writeEnterprisePolicy(t, scopedPolicy))
+	e := NewEnterpriseSourceAt(writePolicyFile(t, "enterprise-policy.json", scopedPolicy))
 	if e.Writable() {
 		t.Fatal("the enterprise source must never be writable")
 	}
@@ -47,9 +38,8 @@ func TestEnterpriseSourceAbsentFileFindsNothing(t *testing.T) {
 		if v != nil || found || err != nil {
 			t.Errorf("%s: Resolve = (%v, %v, %v), want (nil, false, nil)", name, v, found, err)
 		}
-		servers, found, err := e.Servers()
-		if servers != nil || found || err != nil {
-			t.Errorf("%s: Servers = (%v, %v, %v), want (nil, false, nil)", name, servers, found, err)
+		if p, err := e.Policy(); p != nil || err != nil {
+			t.Errorf("%s: Policy = (%v, %v), want (nil, nil)", name, p, err)
 		}
 	}
 }
@@ -65,14 +55,14 @@ func TestEnterpriseSourceDefaultPathIsUnderCentrolDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "enterprise-policy.json"), []byte(scopedPolicy), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	servers, found, err := NewEnterpriseSource().Servers()
-	if err != nil || !found || len(servers) != 2 {
-		t.Fatalf("Servers = (%v, %v, %v), want the two servers from ~/.centrol/enterprise-policy.json", servers, found, err)
+	p, err := NewEnterpriseSource().Policy()
+	if err != nil || p == nil || len(p.Servers) != 2 || p.Source != SourceEnterprisePolicy {
+		t.Fatalf("Policy = (%+v, %v), want the two servers from ~/.centrol/enterprise-policy.json", p, err)
 	}
 }
 
 func TestEnterpriseSourceResolvesServerNames(t *testing.T) {
-	e := NewEnterpriseSourceAt(writeEnterprisePolicy(t, scopedPolicy))
+	e := NewEnterpriseSourceAt(writePolicyFile(t, "enterprise-policy.json", scopedPolicy))
 	v, found, err := e.Resolve(KeyAllowedServers)
 	if err != nil || !found {
 		t.Fatalf("Resolve = (%v, %v, %v), want the server names", v, found, err)
@@ -88,12 +78,17 @@ func TestEnterpriseSourceResolvesServerNames(t *testing.T) {
 	}
 }
 
-func TestEnterpriseSourceServersCarryScope(t *testing.T) {
-	servers, found, err := NewEnterpriseSourceAt(writeEnterprisePolicy(t, scopedPolicy)).Servers()
-	if err != nil || !found {
-		t.Fatalf("Servers = (%v, %v, %v)", servers, found, err)
+func TestEnterprisePolicyCarriesScope(t *testing.T) {
+	path := writePolicyFile(t, "enterprise-policy.json", scopedPolicy)
+	p, err := NewEnterpriseSourceAt(path).Policy()
+	if err != nil || p == nil {
+		t.Fatalf("Policy = (%v, %v)", p, err)
 	}
-	want := []EnterpriseServer{
+	if p.Path != path {
+		t.Errorf("Path = %q, want %q", p.Path, path)
+	}
+	servers := p.Servers
+	want := []PolicyServer{
 		{Server: "server-filesystem", Paths: []string{"src/**", "docs/**"}, Tools: []string{"read_file", "list_directory"}},
 		{Server: "mcp-git"},
 	}
@@ -104,12 +99,13 @@ func TestEnterpriseSourceServersCarryScope(t *testing.T) {
 
 // Absent paths/tools mean unrestricted; present-but-empty means nothing
 // is allowed. The two must stay distinguishable for enforcement.
-func TestEnterpriseServerScopeFieldsAreOptional(t *testing.T) {
-	servers, _, err := NewEnterpriseSourceAt(writeEnterprisePolicy(t,
-		`{"servers":[{"server":"a"},{"server":"b","paths":[],"tools":[]}]}`)).Servers()
+func TestPolicyServerScopeFieldsAreOptional(t *testing.T) {
+	p, err := NewEnterpriseSourceAt(writePolicyFile(t, "enterprise-policy.json",
+		`{"servers":[{"server":"a"},{"server":"b","paths":[],"tools":[]}]}`)).Policy()
 	if err != nil {
-		t.Fatalf("Servers: %v", err)
+		t.Fatalf("Policy: %v", err)
 	}
+	servers := p.Servers
 	if servers[0].Paths != nil || servers[0].Tools != nil {
 		t.Errorf("absent fields must stay nil, got %+v", servers[0])
 	}
@@ -119,7 +115,7 @@ func TestEnterpriseServerScopeFieldsAreOptional(t *testing.T) {
 }
 
 func TestEnterpriseSourceEmptyServerListAllowsNone(t *testing.T) {
-	e := NewEnterpriseSourceAt(writeEnterprisePolicy(t, `{"servers": []}`))
+	e := NewEnterpriseSourceAt(writePolicyFile(t, "enterprise-policy.json", `{"servers": []}`))
 	v, found, err := e.Resolve(KeyAllowedServers)
 	if err != nil || !found {
 		t.Fatalf("Resolve = (%v, %v, %v), want found with an empty list", v, found, err)
@@ -146,15 +142,15 @@ func TestEnterpriseSourceMalformedPolicyFailsClosed(t *testing.T) {
 		"paths not strings": `{"servers": [{"server": "a", "paths": [1]}]}`,
 	}
 	for name, content := range cases {
-		e := NewEnterpriseSourceAt(writeEnterprisePolicy(t, content))
+		e := NewEnterpriseSourceAt(writePolicyFile(t, "enterprise-policy.json", content))
 		for _, key := range []string{KeyAllowedServers, KeyStrictMatching} {
 			v, found, err := e.Resolve(key)
 			if err == nil || found || v != nil {
 				t.Errorf("%s: Resolve(%q) = (%v, %v, %v), want an error and no value", name, key, v, found, err)
 			}
 		}
-		if _, found, err := e.Servers(); err == nil || found {
-			t.Errorf("%s: Servers = found %v, err %v, want an error", name, found, err)
+		if p, err := e.Policy(); err == nil || p != nil {
+			t.Errorf("%s: Policy = (%v, %v), want an error", name, p, err)
 		}
 	}
 }
@@ -181,7 +177,7 @@ func TestMalformedEnterprisePolicyDoesNotFallThroughTheChain(t *testing.T) {
 	}
 	r := NewResolver(
 		NewSessionContractSource(),
-		NewEnterpriseSourceAt(writeEnterprisePolicy(t, `{`)),
+		NewEnterpriseSourceAt(writePolicyFile(t, "enterprise-policy.json", `{`)),
 		NewLocalFileSource(SourceRepoConfig, filepath.Join(dir, "repo.toml")),
 		user,
 		NewDefaultSource(nil),
@@ -202,7 +198,7 @@ func TestEnterprisePolicyWinsTheChainForAllowedServers(t *testing.T) {
 	user := NewLocalFileSource(SourceUserConfig, filepath.Join(dir, "user.toml"))
 	r := NewResolver(
 		session,
-		NewEnterpriseSourceAt(writeEnterprisePolicy(t, `{"servers":[{"server":"approved"}]}`)),
+		NewEnterpriseSourceAt(writePolicyFile(t, "enterprise-policy.json", `{"servers":[{"server":"approved"}]}`)),
 		repo, user, NewDefaultSource(nil),
 	)
 	if err := repo.Write(KeyAllowedServers, []string{"repo-choice"}); err != nil {
@@ -232,7 +228,7 @@ func TestEnterprisePolicyWinsTheChainForAllowedServers(t *testing.T) {
 // touched by the free tier.
 func TestWriteConfigNeverTargetsTheEnterprisePolicy(t *testing.T) {
 	dir := t.TempDir()
-	path := writeEnterprisePolicy(t, scopedPolicy)
+	path := writePolicyFile(t, "enterprise-policy.json", scopedPolicy)
 	r := NewResolver(
 		NewSessionContractSource(),
 		NewEnterpriseSourceAt(path),

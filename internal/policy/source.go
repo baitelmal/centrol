@@ -13,6 +13,7 @@ import (
 const (
 	SourceSessionContract  = "session_contract"
 	SourceEnterprisePolicy = "enterprise_policy"
+	SourceLocalAllowlist   = "local_allowlist"
 	SourceRepoConfig       = "repo_config"
 	SourceUserConfig       = "user_config"
 	SourceDefault          = "default"
@@ -213,8 +214,8 @@ type Resolver struct {
 }
 
 // NewResolver builds a resolution chain from sources in priority order,
-// highest first. The standard v0.1 chain is: session contract,
-// enterprise policy, repo config, user config, built-in defaults.
+// highest first. The standard chain is: session contract, enterprise
+// policy, local allowlist, repo config, user config, built-in defaults.
 func NewResolver(sources ...PolicySource) *Resolver {
 	return &Resolver{sources: sources}
 }

@@ -882,6 +882,23 @@ func TestConfigMenuLocksAllowlistFromEnterprisePolicyFile(t *testing.T) {
 	}
 }
 
+// The enterprise policy locks what it answers; the local allowlist is
+// the user's own file and does not.
+func TestOnlyTheEnterpriseSourceLocksAValue(t *testing.T) {
+	cases := map[string]bool{
+		policy.SourceEnterprisePolicy: true,
+		policy.SourceLocalAllowlist:   false,
+		policy.SourceRepoConfig:       false,
+		policy.SourceUserConfig:       false,
+		policy.SourceDefault:          false,
+	}
+	for source, want := range cases {
+		if got := lockedByEnterprise(source); got != want {
+			t.Errorf("lockedByEnterprise(%q) = %v, want %v", source, got, want)
+		}
+	}
+}
+
 // TestValidTargetURLScheme is a direct unit check of the audit's 3a
 // fix: only http/https schemes (or empty, to unset) are acceptable.
 func TestValidTargetURLScheme(t *testing.T) {
@@ -910,7 +927,7 @@ func TestConfigMenuRejectsInvalidTargetURLScheme(t *testing.T) {
 	dir := t.TempDir()
 	resolver := policy.NewResolver(
 		policy.NewSessionContractSource(),
-		policy.NewEnterpriseSource(),
+		policy.NewEnterpriseSourceAt(filepath.Join(dir, "enterprise-policy.json")),
 		policy.NewLocalFileSource(policy.SourceRepoConfig, filepath.Join(dir, "repo-config.toml")),
 		policy.NewLocalFileSource(policy.SourceUserConfig, filepath.Join(dir, "user-config.toml")),
 		policy.NewDefaultSource(nil),
@@ -950,7 +967,7 @@ func TestConfigMenuEditsGitTimeoutSeconds(t *testing.T) {
 	dir := t.TempDir()
 	resolver := policy.NewResolver(
 		policy.NewSessionContractSource(),
-		policy.NewEnterpriseSource(),
+		policy.NewEnterpriseSourceAt(filepath.Join(dir, "enterprise-policy.json")),
 		policy.NewLocalFileSource(policy.SourceRepoConfig, filepath.Join(dir, "repo-config.toml")),
 		policy.NewLocalFileSource(policy.SourceUserConfig, filepath.Join(dir, "user-config.toml")),
 		policy.NewDefaultSource(nil),
@@ -991,7 +1008,7 @@ func TestConfigMenuEditsTargetExitTimeoutSeconds(t *testing.T) {
 	dir := t.TempDir()
 	resolver := policy.NewResolver(
 		policy.NewSessionContractSource(),
-		policy.NewEnterpriseSource(),
+		policy.NewEnterpriseSourceAt(filepath.Join(dir, "enterprise-policy.json")),
 		policy.NewLocalFileSource(policy.SourceRepoConfig, filepath.Join(dir, "repo-config.toml")),
 		policy.NewLocalFileSource(policy.SourceUserConfig, filepath.Join(dir, "user-config.toml")),
 		policy.NewDefaultSource(nil),

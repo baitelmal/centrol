@@ -36,7 +36,7 @@ func TestSection1Acceptance(t *testing.T) {
 	if err := user.Write("proxy.mass_mutation_threshold", 50); err != nil {
 		t.Fatal(err)
 	}
-	r := NewResolver(NewSessionContractSource(), NewEnterpriseSource(), user, def)
+	r := NewResolver(NewSessionContractSource(), NewEnterpriseSourceAt(filepath.Join(t.TempDir(), "enterprise-policy.json")), user, def)
 	n, source, err := ResolveMassMutationThreshold(r)
 	if err != nil {
 		t.Fatalf("ResolveMassMutationThreshold: %v", err)

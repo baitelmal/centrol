@@ -117,15 +117,17 @@ func repoConfigPath(root string) string {
 	return filepath.Join(centrolDir(root), "config.toml")
 }
 
-// newResolver builds the standard v0.1 chain: session contract (empty —
+// newResolver builds the standard chain: session contract (empty —
 // nothing in the CLI sets per-run overrides yet, but the seam exists),
-// enterprise policy (~/.centrol/enterprise-policy.json, see internal/policy.EnterpriseSource),
-// repo config, user config, then whatever built-in defaults the
-// specific Resolve* helper being called already knows.
+// enterprise policy (~/.centrol/enterprise-policy.json), the user's own
+// structured allowlist (~/.centrol/allowlist.json), repo config, user
+// config, then whatever built-in defaults the specific Resolve* helper
+// being called already knows.
 func newResolver(root string) *policy.Resolver {
 	return policy.NewResolver(
 		policy.NewSessionContractSource(),
 		policy.NewEnterpriseSource(),
+		policy.NewLocalAllowlistSource(),
 		policy.NewLocalFileSource(policy.SourceRepoConfig, repoConfigPath(root)),
 		policy.NewLocalFileSource(policy.SourceUserConfig, userConfigPath()),
 		policy.NewDefaultSource(nil),

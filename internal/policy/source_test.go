@@ -141,7 +141,7 @@ func TestLocalFileSourceWriteLeavesNoTempFileOnSuccess(t *testing.T) {
 func TestResolutionChainPriorityOrder(t *testing.T) {
 	dir := t.TempDir()
 	session := NewSessionContractSource()
-	enterprise := NewEnterpriseSource()
+	enterprise := NewEnterpriseSourceAt(filepath.Join(t.TempDir(), "enterprise-policy.json"))
 	repo := NewLocalFileSource(SourceRepoConfig, filepath.Join(dir, "repo.toml"))
 	user := NewLocalFileSource(SourceUserConfig, filepath.Join(dir, "user.toml"))
 	def := NewDefaultSource(map[string]interface{}{"proxy.mass_mutation_threshold": 20})
@@ -182,7 +182,7 @@ func TestResolutionChainPriorityOrder(t *testing.T) {
 func TestWriteConfigTargetsHighestPriorityWritableSource(t *testing.T) {
 	dir := t.TempDir()
 	session := NewSessionContractSource()
-	enterprise := NewEnterpriseSource()
+	enterprise := NewEnterpriseSourceAt(filepath.Join(t.TempDir(), "enterprise-policy.json"))
 	repo := NewLocalFileSource(SourceRepoConfig, filepath.Join(dir, "repo.toml"))
 	user := NewLocalFileSource(SourceUserConfig, filepath.Join(dir, "user.toml"))
 	def := NewDefaultSource(nil)
