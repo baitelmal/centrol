@@ -77,6 +77,13 @@ Clean, structurally sound code. Not patchwork. Specifically:
   and continue. Cleanup happens in a dedicated pass.
 - Do not add abstractions for hypothetical future needs.
 
+## Trusted files are protected
+
+Anything the tool reads and trusts must be in the protected set. The
+ledger is; config and policy files were not. When adding a new file
+the runtime reads and acts on, add it to ProtectedPaths and, if it
+lives outside the repo, to the guard's watch set.
+
 ## MCP allowlist sources
 
 The free-tier structured policy files (`~/.centrol/enterprise-policy.json`,
