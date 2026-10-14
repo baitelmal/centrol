@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/scirem/centrol/internal/policy"
+	"github.com/scirem/centrol/internal/ui"
 )
 
 // binPath is built once for the whole package and reused by every test
@@ -1320,28 +1321,42 @@ func TestProxyTargetURLFlagForwardsThroughHTTPTarget(t *testing.T) {
 	}
 }
 
-// runProxyAgainstHTTP runs `centrol proxy` against an HTTP target with
-// HOME pointed at a temp directory holding the given allowlist.json,
-// feeds it the requests, and returns stdout and stderr.
-func runProxyAgainstHTTP(t *testing.T, targetURL, allowlist string, requests ...string) (stdout, stderr string) {
+// runProxy runs `centrol proxy` with the given arguments and HOME
+// pointed at a temp directory holding the given files under ~/.centrol
+// (name -> content), feeds it the requests, and returns stdout, stderr
+// and the exit code. Stdin EOF ends the run, so a non-zero exit is not
+// itself a failure; callers assert on it where it matters.
+func runProxy(t *testing.T, homeFiles map[string]string, proxyArgs []string, requests ...string) (stdout, stderr string, exitCode int) {
 	t.Helper()
 	dir := initTestRepo(t)
 	home := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, ".centrol"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(home, ".centrol", "allowlist.json"), []byte(allowlist), 0o600); err != nil {
-		t.Fatal(err)
+	for name, content := range homeFiles {
+		if err := os.WriteFile(filepath.Join(home, ".centrol", name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	cmd := exec.Command(binPath, "proxy", "--target-url", targetURL)
+	cmd := exec.Command(binPath, append([]string{"proxy"}, proxyArgs...)...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "HOME="+home, "USERPROFILE="+home)
+	// A new session has no controlling terminal, so an unknown-server
+	// prompt takes its unattended path instead of blocking on a
+	// developer's own terminal.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Stdin = strings.NewReader(strings.Join(requests, "\n") + "\n")
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
-	_ = cmd.Run() // stdin EOF ends the run; the exit code is asserted by callers that care
-	return outBuf.String(), errBuf.String()
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			t.Fatalf("running centrol proxy: %v", err)
+		}
+	}
+	return outBuf.String(), errBuf.String(), exitCode
 }
 
 // TestProxyEnforcesTheLocalAllowlistAtCallTime proves the whole chain:
@@ -1354,7 +1369,7 @@ func TestProxyEnforcesTheLocalAllowlistAtCallTime(t *testing.T) {
 	host := strings.TrimPrefix(srv.URL, "http://")
 	allowlist := fmt.Sprintf(`{"servers":[{"server":%q,"tools":["read_file"]}]}`, host)
 
-	stdout, stderr := runProxyAgainstHTTP(t, srv.URL, allowlist,
+	stdout, stderr, _ := runProxy(t, map[string]string{"allowlist.json": allowlist}, []string{"--target-url", srv.URL},
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a.go"}}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"a.go"}}}`,
 	)
@@ -1372,13 +1387,114 @@ func TestProxyEnforcesTheLocalAllowlistAtCallTime(t *testing.T) {
 func TestProxyRefusesToStartOnAMalformedAllowlist(t *testing.T) {
 	srv := echoJSONRPCServer(t)
 	defer srv.Close()
-	stdout, stderr := runProxyAgainstHTTP(t, srv.URL, `{`,
+	stdout, stderr, _ := runProxy(t, map[string]string{"allowlist.json": `{`}, []string{"--target-url", srv.URL},
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a.go"}}}`)
 	if strings.Contains(stdout, `"ok":true`) {
 		t.Fatalf("a malformed policy must not let the call through, got stdout: %q", stdout)
 	}
 	if !strings.Contains(stderr, "local allowlist") || !strings.Contains(stderr, "allowlist.json") {
 		t.Fatalf("expected the error to name the local allowlist file, got stderr: %s", stderr)
+	}
+}
+
+// With a structured policy active, an unlisted server is refused at
+// launch with no prompt, and the message says whose policy it is and
+// where to add the server. "cat" stands in for an MCP server: it echoes
+// each request line back, which is all these tests need from one.
+func TestProxyRefusesAnUnlistedServerWithoutPromptingLocalAllowlist(t *testing.T) {
+	_, stderr, code := runProxy(t,
+		map[string]string{"allowlist.json": `{"servers":[{"server":"something-else"}]}`},
+		[]string{"--target", "cat"},
+		`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	if code != ui.ExitPolicyBlock {
+		t.Fatalf("exit code = %d, want %d (policy block); stderr: %s", code, ui.ExitPolicyBlock, stderr)
+	}
+	for _, want := range []string{"cat is not permitted by the MCP policy", "local allowlist.json", "allowlist.json)", "add the server there"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr missing %q:\n%s", want, stderr)
+		}
+	}
+	if strings.Contains(stderr, "Unknown MCP server") || strings.Contains(stderr, "no interactive terminal") {
+		t.Errorf("the unknown-server prompt must be disabled while a structured policy is active:\n%s", stderr)
+	}
+}
+
+func TestProxyRefusesAnUnlistedServerWithoutPromptingEnterprisePolicy(t *testing.T) {
+	_, stderr, code := runProxy(t,
+		map[string]string{"enterprise-policy.json": `{"servers":[{"server":"something-else"}]}`},
+		[]string{"--target", "cat"},
+		`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	if code != ui.ExitPolicyBlock {
+		t.Fatalf("exit code = %d, want %d (policy block); stderr: %s", code, ui.ExitPolicyBlock, stderr)
+	}
+	if !strings.Contains(stderr, "controlled by the enterprise policy") || !strings.Contains(stderr, "contact your administrator") {
+		t.Errorf("expected the enterprise message, got:\n%s", stderr)
+	}
+}
+
+func TestProxyStartsAListedServerUnderAStructuredPolicy(t *testing.T) {
+	stdout, stderr, code := runProxy(t,
+		map[string]string{"allowlist.json": `{"servers":[{"server":"cat"}]}`},
+		[]string{"--target", "cat"},
+		`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	if strings.Contains(stderr, "not permitted") || strings.Contains(stderr, "Unknown MCP server") {
+		t.Fatalf("a listed server must start without a prompt or refusal, got stderr: %s (exit %d)", stderr, code)
+	}
+	if !strings.Contains(stdout, `"method":"ping"`) {
+		t.Fatalf("expected the request to reach the target and echo back, got stdout: %q", stdout)
+	}
+}
+
+// No structured policy: the unknown-server prompt is exactly as before
+// (here, with no terminal, it allows this run once and says so).
+func TestProxyPromptIsUnchangedWithoutAStructuredPolicy(t *testing.T) {
+	_, stderr, code := runProxy(t, nil, []string{"--target", "cat"},
+		`{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	if code == ui.ExitPolicyBlock || strings.Contains(stderr, "not permitted by the MCP policy") {
+		t.Fatalf("with no structured policy the prompt path must be unchanged, got exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stderr, "unknown MCP server") && !strings.Contains(stderr, "Unknown MCP server") {
+		t.Fatalf("expected the unknown-server prompt path, got stderr: %s", stderr)
+	}
+}
+
+// While allowlist.json is the allowlist, adding a server through the
+// config menu would write a config.toml the file shadows, so the menu
+// says where to add it instead and writes nothing.
+func TestConfigMenuPointsAtTheLocalAllowlistInsteadOfShadowedWrites(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "allowlist.json")
+	if err := os.WriteFile(policyPath, []byte(`{"servers":[{"server":"server-filesystem"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver := policy.NewResolver(
+		policy.NewSessionContractSource(),
+		policy.NewEnterpriseSourceAt(filepath.Join(dir, "enterprise-policy.json")),
+		policy.NewLocalAllowlistSourceAt(policyPath),
+		policy.NewLocalFileSource(policy.SourceRepoConfig, filepath.Join(dir, "repo-config.toml")),
+		policy.NewLocalFileSource(policy.SourceUserConfig, filepath.Join(dir, "user-config.toml")),
+		policy.NewDefaultSource(nil),
+	)
+
+	in := bufio.NewReader(strings.NewReader("1\n+\nb\nq\n"))
+	var out bytes.Buffer
+	runConfigMenu(in, &out, resolver)
+
+	got := out.String()
+	if !strings.Contains(got, "server-filesystem") || !strings.Contains(got, "[from allowlist.json]") {
+		t.Fatalf("expected the allowlist entry attributed to allowlist.json, got:\n%s", got)
+	}
+	if strings.Contains(got, "locked by enterprise") || strings.Contains(got, "[editable]") {
+		t.Fatalf("a local allowlist is neither locked nor editable here, got:\n%s", got)
+	}
+	if !strings.Contains(got, policyPath) || !strings.Contains(got, "add the server there") {
+		t.Fatalf("expected the refusal to name %s, got:\n%s", policyPath, got)
+	}
+	if strings.Contains(got, "Package or binary name to allow") {
+		t.Fatalf("the add prompt must not appear, got:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "repo-config.toml")); err == nil {
+		t.Fatal("nothing may be written to config.toml")
 	}
 }
 

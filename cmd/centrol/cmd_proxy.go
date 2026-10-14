@@ -226,21 +226,39 @@ func cmdProxyRun(args []string) {
 		logger.Infof("centrol: observe mode — evaluating policy, never prompting, never blocking\n")
 	}
 
-	// MCP server allowlist pre-flight: an unknown server (by
-	// package/binary identity, unless strict_matching is on) prompts
-	// once before the session starts rather than blocking silently.
-	// Observe mode skips this entirely — no prompts, no gate — and
-	// simply proceeds, matching the same "never prompt, never block"
-	// contract as the tool-call-level policy evaluation below.
-	//
-	// This whole pre-flight is stdio-only: it exists to vet an
-	// arbitrary local subprocess (an npx/uvx package, say) by
-	// package/binary identity before spawning it. An HTTP target is a
-	// URL the operator configured directly (--target-url or the
-	// persisted proxy.target_url) — there is no subprocess identity
-	// here for the allowlist to match against, so there is nothing for
-	// this step to do for useHTTP.
-	if !useHTTP {
+	// An active structured policy is the allowlist, absolutely: a server
+	// it does not list is refused here, with no prompt, because the
+	// prompt's "Add to allowlist" would write config.toml, which the
+	// policy shadows — the next run would be refused again. The listed
+	// server's tools and paths are enforced per call, from the contract.
+	// Observe mode records what would have been refused and proceeds.
+	if activePolicy != nil {
+		if _, listed := activePolicy.Server(identity); !listed {
+			if !observe {
+				end("allowlist_denied", ui.ExitPolicyBlock, func() {
+					fmt.Fprintln(os.Stderr, structuredPolicyDenial(activePolicy, identity))
+				})
+				return
+			}
+			_ = emit(runID, "proxy", "policy.amend", map[string]interface{}{
+				"action": "allow_server", "server": identity, "decision": "would_flag", "source": activePolicy.Source,
+			})
+		}
+	} else if !useHTTP {
+		// MCP server allowlist pre-flight: an unknown server (by
+		// package/binary identity, unless strict_matching is on) prompts
+		// once before the session starts rather than blocking silently.
+		// Observe mode skips this entirely — no prompts, no gate — and
+		// simply proceeds, matching the same "never prompt, never block"
+		// contract as the tool-call-level policy evaluation below.
+		//
+		// This whole pre-flight is stdio-only: it exists to vet an
+		// arbitrary local subprocess (an npx/uvx package, say) by
+		// package/binary identity before spawning it. An HTTP target is a
+		// URL the operator configured directly (--target-url or the
+		// persisted proxy.target_url) — there is no subprocess identity
+		// here for the allowlist to match against, so there is nothing for
+		// this step to do for useHTTP.
 		var allowed []string
 		if err := runSetup(ctx, end, signalOutcome, func() error {
 			var e error

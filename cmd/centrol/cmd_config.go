@@ -117,16 +117,22 @@ func configAllowlistMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resol
 			return
 		}
 		locked := lockedByEnterprise(source)
+		// The user's own allowlist.json is not locked, but it shadows
+		// config.toml, so a server added here would never take effect.
+		fromFile := source == policy.SourceLocalAllowlist
 
 		fmt.Fprintln(out, "\nMCP Server Allowlist")
 		for _, s := range editable {
-			if locked {
+			switch {
+			case locked:
 				fmt.Fprintf(out, "  %s %-45s [locked by enterprise]\n", ui.Glyph(out, ui.GlyphOK), s)
-			} else {
+			case fromFile:
+				fmt.Fprintf(out, "  %s %-45s [from allowlist.json]\n", ui.Glyph(out, ui.GlyphOK), s)
+			default:
 				fmt.Fprintf(out, "  %s %-45s [editable]\n", ui.Glyph(out, ui.GlyphOK), s)
 			}
 		}
-		if !locked {
+		if !locked && !fromFile {
 			fmt.Fprintln(out, "  + Add server...")
 		}
 		fmt.Fprintln(out, "  b) Back")
@@ -139,6 +145,15 @@ func configAllowlistMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resol
 		case "+", "add", "a":
 			if locked {
 				fmt.Fprintln(out, "the allowlist is locked by enterprise policy and cannot be edited here")
+				continue
+			}
+			if fromFile {
+				active, err := resolver.ActivePolicy()
+				if err != nil || active == nil {
+					fmt.Fprintf(out, "error reading allowlist: %v\n", err)
+					continue
+				}
+				fmt.Fprintln(out, policyControlNote(active))
 				continue
 			}
 			fmt.Fprint(out, "Package or binary name to allow: ")

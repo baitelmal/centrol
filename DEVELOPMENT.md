@@ -77,6 +77,12 @@ Clean, structurally sound code. Not patchwork. Specifically:
   and continue. Cleanup happens in a dedicated pass.
 - Do not add abstractions for hypothetical future needs.
 
+## MCP allowlist sources
+
+The free-tier structured policy files (`~/.centrol/enterprise-policy.json`,
+then `~/.centrol/allowlist.json`) are the higher-priority allowlist
+source; `config.toml`'s flat `proxy.allowed_servers` remains supported.
+
 ## Code hygiene audit (scheduled, not ad-hoc)
 
 "Do not refactor prior passes during a later pass" is a within-

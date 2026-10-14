@@ -366,7 +366,7 @@ allow_session_amend = true          # "Allow session" persists for the rest of t
 
 [proxy]
 mass_mutation_threshold = 20        # tool calls touching more files than this in one call are flagged (proxy-only; guard does not evaluate this)
-allowed_servers = []                # MCP server identities pre-approved without a prompt
+allowed_servers = []                # MCP server identities pre-approved without a prompt (shadowed while an MCP policy file is active; see below)
 strict_matching = false             # true: match server identity exactly, not just by package/binary
 additional_block_paths = []         # extra hard-blocked paths, on top of the built-in ~/.ssh, ~/.aws, /etc, /root
                                      # (consulted by both guard and proxy — guard flags a write to any of
@@ -386,7 +386,81 @@ observe_mode = false                 # true: evaluate policy everywhere, never p
 Every key above is live — it changes real behavior, not just what gets
 logged. `centrol config`'s "View effective config" section shows the
 resolved value and source (`session_contract` / `enterprise_policy` /
-`repo_config` / `user_config` / `default`) for each one.
+`local_allowlist` / `repo_config` / `user_config` / `default`) for each one.
+
+## MCP policy files
+
+`proxy.allowed_servers` is a flat list of server names. For finer
+control — which tools a server may be called with, and which paths it
+may touch — centrol reads a structured policy from a JSON file in
+`~/.centrol`:
+
+| File | Written by |
+|---|---|
+| `enterprise-policy.json` | the enterprise tier, not the user; its values show as locked in `centrol config` |
+| `allowlist.json` | you, by hand; centrol never writes it |
+
+Both use the same schema:
+
+```json
+{
+  "servers": [
+    {
+      "server": "server-filesystem",
+      "paths": ["src/**", "docs/*.md"],
+      "tools": ["read_file", "list_directory"]
+    },
+    { "server": "mcp-git" }
+  ]
+}
+```
+
+- `server` is the server's identity, as in `allowed_servers`: the
+  package or binary name for a stdio target, or the URL host (with the
+  port, if one is given) for an HTTP target.
+- `tools` lists the tool names the server may be called with, exactly.
+  `paths` lists the paths its calls may touch, relative to the repo
+  root; `*` matches within one path segment, `**` matches any number of
+  segments, so `src/**` is `src` and everything under it, while a bare
+  `src` is only that exact path.
+- **Absent means unrestricted; empty means nothing.** A server with no
+  `tools` may call any tool, and one with no `paths` may touch any path.
+  `"tools": []` allows no tool at all, and `"paths": []` allows no path.
+- **A policy narrows; it never widens.** Path patterns only restrict
+  within what centrol already allows, so they cannot grant access to
+  anything outside the repo or to the built-in protected paths.
+
+**Which file is active.** If `enterprise-policy.json` exists, it is the
+policy. Otherwise, if `allowlist.json` exists, it is. Otherwise
+`config.toml`'s `allowed_servers` applies, exactly as before. Active
+means absolute: the policy's server list *is* the allowlist, and
+`config.toml`'s list is ignored while a policy is active. A server the
+policy does not list is refused at launch with no prompt (adding it to
+`config.toml` would be shadowed), and `centrol config` points you at the
+file instead of offering to add it. `strict_matching` does not apply to
+a policy, which always matches by server identity. Observe mode records
+what would have been refused and proceeds.
+
+**Checked per call.** For each `tools/call`, the listed server's `tools`
+and `paths` are checked before the existing checks run. Paths are judged
+from the path-like values in a call's arguments, so a server that takes a
+path in an unusual form is only as well scoped as that detection. centrol
+does not rewrite `tools/list`; a tool outside the list still appears to
+the client, and is refused when called.
+
+**A file that exists but cannot be read or parsed fails closed.** centrol
+stops with an error naming the file wherever it resolves config, instead
+of falling back to a more permissive source. The parser is
+strict: an unknown field, a missing `servers` key, an empty or duplicate
+server name, or trailing content is an error. The consequence for
+releases is that a field added to the enterprise policy file in a later
+version fails closed on an older centrol until it is upgraded, so the
+two tiers need to be upgraded together.
+
+If the home directory cannot be determined, no policy file is looked for
+and the flat `config.toml` allowlist applies; this keeps minimal
+containers working, and means whoever controls the process's `HOME`
+controls which policy files it sees.
 
 ## Run summary
 

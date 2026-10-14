@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/scirem/centrol/internal/gate"
+	"github.com/scirem/centrol/internal/policy"
 )
 
 type allowlistDecision int
@@ -79,4 +80,20 @@ func promptServerAllowlist(identity, fullCommand string) allowlistDecision {
 	default:
 		return allowlistDeny
 	}
+}
+
+// policyControlNote says who controls the structured MCP policy in
+// force and where a server has to be added. A user's own allowlist.json
+// is named by path; the enterprise policy is not the user's to edit.
+func policyControlNote(p *policy.StructuredPolicy) string {
+	if p.Source == policy.SourceEnterprisePolicy {
+		return "The MCP policy is controlled by the enterprise policy; contact your administrator to add the server."
+	}
+	return fmt.Sprintf("The MCP policy is controlled by the local allowlist.json (%s); add the server there.", p.Path)
+}
+
+// structuredPolicyDenial is what replaces the unknown-server prompt
+// when a structured policy is active and does not list the server.
+func structuredPolicyDenial(p *policy.StructuredPolicy, identity string) string {
+	return fmt.Sprintf("centrol: denied — %s is not permitted by the MCP policy. %s", identity, policyControlNote(p))
 }
