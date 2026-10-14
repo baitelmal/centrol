@@ -73,7 +73,7 @@ type Watcher struct {
 	runID    string
 	ignore   *IgnoreSet
 	fsw      *fsnotify.Watcher
-	external map[string]bool // absolute files outside the repo that are observed too; see WatchExternalFiles
+	trusted  map[string]bool // trusted files the recursive watch cannot see; observed individually, see WatchTrustedFiles
 	emit     EmitFunc
 	debounce time.Duration // guard.watcher_debounce_ms, resolved by the caller; 0 disables coalescing entirely
 
@@ -183,7 +183,7 @@ func NewWatcherWithDebounce(repoRoot, runID string, ignore *IgnoreSet, emit Emit
 	}
 	w := &Watcher{
 		repoRoot: repoRoot, runID: runID, ignore: ignore, fsw: fsw, emit: emit,
-		debounce: debounce, pending: map[string]*pendingFSEvent{}, external: map[string]bool{},
+		debounce: debounce, pending: map[string]*pendingFSEvent{}, trusted: map[string]bool{},
 	}
 	if err := w.addRecursive(repoRoot); err != nil {
 		fsw.Close()
@@ -192,22 +192,25 @@ func NewWatcherWithDebounce(repoRoot, runID string, ignore *IgnoreSet, emit Emit
 	return w, nil
 }
 
-// WatchExternalFiles observes specific files outside the repo — the
-// policy files under ~/.centrol, which decide what the agent may do.
+// WatchTrustedFiles observes specific files that the recursive repo
+// watch cannot see: the policy files under ~/.centrol, outside the repo,
+// and <repo>/.centrol/config.toml, which is inside the directory the
+// recursive watch excludes unconditionally (the ledger lives there).
 // fsnotify watches directories, so each file's parent directory is
-// watched, and only events for the listed files are reported: anything
-// else that lands in that directory (including this tool's own atomic
-// temp files) is ignored. A parent directory that does not exist yet is
-// created (0700, as the config writer would), because an agent creating
-// a policy file in a directory that was not there at startup is the
-// case most worth seeing.
+// watched, but not recursively, and only events for the listed files are
+// reported: anything else that lands in that directory, such as the
+// ledger segments or this tool's own atomic temp files, is consumed and
+// ignored. A parent directory that does not exist yet is created (0700,
+// as the config writer would), because an agent creating a policy file
+// in a directory that was not there at startup is the case most worth
+// seeing. Call it before Run.
 //
 // This is detection, not prevention. A direct write by the agent
 // process never passes through the proxy, which sees tool calls only,
 // so it cannot be refused here; it is recorded as an fs.* event with the
 // absolute path, and the protected-path check turns that into a
 // policy.violation.
-func (w *Watcher) WatchExternalFiles(files []string) error {
+func (w *Watcher) WatchTrustedFiles(files []string) error {
 	for _, f := range files {
 		f = filepath.Clean(f)
 		dir := filepath.Dir(f)
@@ -217,25 +220,25 @@ func (w *Watcher) WatchExternalFiles(files []string) error {
 		if err := w.fsw.Add(dir); err != nil {
 			return fmt.Errorf("watching %s: %w", f, err)
 		}
-		w.external[f] = true
+		w.trusted[f] = true
 	}
 	return nil
 }
 
-// externalEvent reports whether ev belongs to the external file watch
-// and, if so, handles it. Events for other files in a watched external
-// directory are consumed and dropped. It runs before every repo rule
-// because those rules are about paths inside the repo root: applied to
-// a path outside it they would misreport it as a symlink escape, and if
-// the repo root is the home directory, the repo's hard .centrol
-// exclusion would otherwise swallow the very files being watched.
-func (w *Watcher) externalEvent(ev fsnotify.Event) bool {
-	if len(w.external) == 0 {
+// trustedEvent reports whether ev belongs to the trusted-file watch
+// and, if so, handles it. Events for other files in a watched directory
+// are consumed and dropped. It runs before every repo rule because those
+// rules are about the repo tree: applied to a path outside it they would
+// misreport it as a symlink escape, and the hard .centrol exclusion
+// would otherwise swallow the very files being watched (the repo config,
+// and the home files when the repo root is the home directory).
+func (w *Watcher) trustedEvent(ev fsnotify.Event) bool {
+	if len(w.trusted) == 0 {
 		return false
 	}
 	abs := filepath.Clean(ev.Name)
-	if !w.external[abs] {
-		for f := range w.external {
+	if !w.trusted[abs] {
+		for f := range w.trusted {
 			if filepath.Dir(f) == filepath.Dir(abs) {
 				return true
 			}
@@ -458,7 +461,7 @@ func (w *Watcher) Run() {
 }
 
 func (w *Watcher) handle(ev fsnotify.Event) {
-	if w.externalEvent(ev) {
+	if w.trustedEvent(ev) {
 		return
 	}
 	absPath := ev.Name

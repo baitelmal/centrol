@@ -110,7 +110,7 @@ func userConfigPath() string {
 }
 
 func repoConfigPath(root string) string {
-	return filepath.Join(centrolDir(root), "config.toml")
+	return policy.RepoConfigPath(root)
 }
 
 // newResolver builds the standard chain: session contract (empty —

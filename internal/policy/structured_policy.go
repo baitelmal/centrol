@@ -165,25 +165,36 @@ func centrolHomeFile(name string) string {
 	return filepath.Join(home, ".centrol", name)
 }
 
-// userConfigFile is the user-level config.toml, beside the policy files.
-const userConfigFile = "config.toml"
+// configFileName is the name of both config files: the user's, beside
+// the policy files in ~/.centrol, and the repo's, in <repo>/.centrol.
+const configFileName = "config.toml"
 
 // UserConfigPath is ~/.centrol/config.toml, or "" when the home
 // directory cannot be resolved.
-func UserConfigPath() string { return centrolHomeFile(userConfigFile) }
+func UserConfigPath() string { return centrolHomeFile(configFileName) }
 
-// TrustedHomeFiles are the files under ~/.centrol that decide what the
-// agent may do: the enterprise policy, the user's own allowlist and the
-// user config. They are the contents of the default protected set (an
-// MCP call to one is refused) and what the guard watches (a direct
-// write is recorded). Nothing here is user-tunable. It is empty when
-// the home directory cannot be resolved.
-func TrustedHomeFiles() []string {
+// RepoConfigPath is <repoRoot>/.centrol/config.toml.
+func RepoConfigPath(repoRoot string) string {
+	return filepath.Join(repoRoot, ".centrol", configFileName)
+}
+
+// TrustedFiles are the files that decide what the agent may do: the
+// enterprise policy, the user's own allowlist and the user config under
+// ~/.centrol, and the repo's own config, which outranks the user config.
+// They are the trusted part of the default protected set (an MCP call to
+// one is refused) and what the guard watches (a direct write is
+// recorded). Nothing here is user-tunable. The home files are absent
+// when the home directory cannot be resolved, and the repo config when
+// repoRoot is empty.
+func TrustedFiles(repoRoot string) []string {
 	var files []string
-	for _, name := range []string{enterprisePolicyFile, localAllowlistFile, userConfigFile} {
+	for _, name := range []string{enterprisePolicyFile, localAllowlistFile, configFileName} {
 		if path := centrolHomeFile(name); path != "" {
 			files = append(files, path)
 		}
+	}
+	if repoRoot != "" {
+		files = append(files, RepoConfigPath(repoRoot))
 	}
 	return files
 }

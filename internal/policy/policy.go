@@ -103,11 +103,11 @@ func DefaultContract(kind Kind, taskID, repoRoot string) Contract {
 		RepoRoot:              repoRoot,
 		AllowedPaths:          []string{"."},
 		MassMutationThreshold: DefaultMassMutationThreshold,
-		ProtectedPaths:        defaultProtectedPaths(),
+		ProtectedPaths:        defaultProtectedPaths(repoRoot),
 	}
 }
 
-func defaultProtectedPaths() []string {
+func defaultProtectedPaths(repoRoot string) []string {
 	home, err := os.UserHomeDir()
 	paths := []string{"/etc", "/root"}
 	if err == nil && home != "" {
@@ -118,7 +118,7 @@ func defaultProtectedPaths() []string {
 		paths = append(paths, "~/.ssh", "~/.aws")
 	}
 	// Anything the tool reads and trusts is protected (DEVELOPMENT.md).
-	paths = append(paths, TrustedHomeFiles()...)
+	paths = append(paths, TrustedFiles(repoRoot)...)
 	return CanonicalizeBlockPaths(paths)
 }
 

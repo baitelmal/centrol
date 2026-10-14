@@ -242,12 +242,13 @@ func cmdGuard(args []string) {
 		})
 		return
 	}
-	// The policy files under ~/.centrol are outside the repo, so the
-	// repo watch cannot see them. Observing them is best-effort like
-	// tamper detection below: a failure is a warning, not a reason to
-	// abort an otherwise-fine run.
-	if err := watcher.WatchExternalFiles(policy.TrustedHomeFiles()); err != nil {
-		fmt.Fprintf(os.Stderr, "centrol guard: warning: not watching the policy files: %v\n", err)
+	// The policy files under ~/.centrol are outside the repo, and the
+	// repo's own config.toml is inside the .centrol directory the repo
+	// watch excludes, so none of them is seen by it. Observing them is
+	// best-effort like tamper detection below: a failure is a warning,
+	// not a reason to abort an otherwise-fine run.
+	if err := watcher.WatchTrustedFiles(policy.TrustedFiles(root)); err != nil {
+		fmt.Fprintf(os.Stderr, "centrol guard: warning: not watching the policy and config files: %v\n", err)
 	}
 	watcherDone := make(chan struct{})
 	go func() { watcher.Run(); close(watcherDone) }()

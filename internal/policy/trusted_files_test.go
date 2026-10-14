@@ -24,19 +24,19 @@ func trustedHome(t *testing.T) string {
 
 var trustedNames = []string{"enterprise-policy.json", "allowlist.json", "config.toml"}
 
-func TestTrustedHomeFilesAreExactlyTheThree(t *testing.T) {
+func TestTrustedFilesAreExactlyTheThreeInHome(t *testing.T) {
 	home := trustedHome(t)
 	var want []string
 	for _, n := range trustedNames {
 		want = append(want, filepath.Join(home, ".centrol", n))
 	}
-	got := TrustedHomeFiles()
+	got := TrustedFiles("")
 	if len(got) != len(want) {
-		t.Fatalf("TrustedHomeFiles = %v, want %v", got, want)
+		t.Fatalf("TrustedFiles = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("TrustedHomeFiles[%d] = %q, want %q", i, got[i], want[i])
+			t.Errorf("TrustedFiles[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
 	if p := UserConfigPath(); p != want[2] {
@@ -44,11 +44,11 @@ func TestTrustedHomeFilesAreExactlyTheThree(t *testing.T) {
 	}
 }
 
-func TestTrustedHomeFilesEmptyWithoutAHome(t *testing.T) {
+func TestTrustedFilesEmptyWithoutAHomeOrRepo(t *testing.T) {
 	t.Setenv("HOME", "")
 	t.Setenv("USERPROFILE", "")
-	if got := TrustedHomeFiles(); len(got) != 0 {
-		t.Fatalf("TrustedHomeFiles = %v, want none when HOME is unresolvable", got)
+	if got := TrustedFiles(""); len(got) != 0 {
+		t.Fatalf("TrustedFiles = %v, want none when HOME is unresolvable", got)
 	}
 }
 
@@ -102,7 +102,7 @@ func TestOtherFilesUnderCentrolHomeAreNotBlocked(t *testing.T) {
 
 // The guard judges a direct write to a policy file by the same
 // protected set, so it is recorded as a block-tier violation (recorded,
-// not prevented — see Watcher.WatchExternalFiles).
+// not prevented — see Watcher.WatchTrustedFiles).
 func TestGuardEventsForThePolicyFilesAreBlockTier(t *testing.T) {
 	home := trustedHome(t)
 	c := DefaultContract(KindGuard, "run-1", home)
@@ -111,5 +111,82 @@ func TestGuardEventsForThePolicyFilesAreBlockTier(t *testing.T) {
 		if tier, reason := EvaluateFSPath(path, c); tier != Block || !strings.Contains(reason, "credential or system path") {
 			t.Errorf("EvaluateFSPath(%q) = (%v, %q), want Block", path, tier, reason)
 		}
+	}
+}
+
+// The repo's own config.toml outranks the user config, so an MCP call
+// that names it is refused by the protected set. The repo is separate
+// from the home directory, and the file is inside the repo scope, so no
+// other rule would refuse the call.
+func TestToolCallsToTheRepoConfigAreBlocked(t *testing.T) {
+	trustedHome(t)
+	repo, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, exists := range []bool{false, true} {
+		if exists {
+			if err := os.MkdirAll(filepath.Join(repo, ".centrol"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, ".centrol", "config.toml"), []byte("[general]\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c := DefaultContract(KindProxy, "run-1", repo)
+		for _, spelling := range []string{filepath.Join(repo, ".centrol", "config.toml"), ".centrol/config.toml"} {
+			tier, reason := EvaluateToolCall(ToolCallArgs{ToolName: "write_file", PathArgs: []string{spelling}}, c)
+			if tier != Block || !strings.Contains(reason, "credential or system path") {
+				t.Errorf("exists=%v: write to %q = (%v, %q), want a protected-path Block", exists, spelling, tier, reason)
+			}
+		}
+	}
+}
+
+// Only the config file is carved out of the repo's .centrol directory.
+// The ledger is guarded by its hash chain and tamper detection, not by
+// this set, so a tool call naming a segment is not refused by it.
+func TestRepoCentrolDirectoryIsNotProtectedBeyondTheConfig(t *testing.T) {
+	trustedHome(t)
+	repo := t.TempDir()
+	c := DefaultContract(KindProxy, "run-1", repo)
+	for _, name := range []string{"lighthouse.jsonl", "lighthouse.001.jsonl", "scope-requests.jsonl", "config.toml.bak"} {
+		tier, reason := EvaluateToolCall(ToolCallArgs{ToolName: "write_file", PathArgs: []string{filepath.Join(".centrol", name)}}, c)
+		if tier == Block {
+			t.Errorf(".centrol/%s was blocked (%q); only config.toml is added to the protected set", name, reason)
+		}
+	}
+}
+
+func TestTrustedFilesIncludeTheRepoConfigAndKeepTheHomeFiles(t *testing.T) {
+	home := trustedHome(t)
+	repo := filepath.Join(home, "proj")
+	got := TrustedFiles(repo)
+	want := []string{
+		filepath.Join(home, ".centrol", "enterprise-policy.json"),
+		filepath.Join(home, ".centrol", "allowlist.json"),
+		filepath.Join(home, ".centrol", "config.toml"),
+		filepath.Join(repo, ".centrol", "config.toml"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("TrustedFiles = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("TrustedFiles[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if RepoConfigPath(repo) != want[3] {
+		t.Errorf("RepoConfigPath = %q, want %q", RepoConfigPath(repo), want[3])
+	}
+}
+
+func TestGuardEventsForTheRepoConfigAreBlockTier(t *testing.T) {
+	trustedHome(t)
+	repo, _ := filepath.EvalSymlinks(t.TempDir())
+	c := DefaultContract(KindGuard, "run-1", repo)
+	path := filepath.Join(repo, ".centrol", "config.toml")
+	if tier, reason := EvaluateFSPath(path, c); tier != Block || !strings.Contains(reason, "credential or system path") {
+		t.Fatalf("EvaluateFSPath(%q) = (%v, %q), want a protected-path Block", path, tier, reason)
 	}
 }

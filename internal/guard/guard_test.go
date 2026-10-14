@@ -998,9 +998,9 @@ func TestCheckedEmitEscalatesAfterThreeConsecutiveFailures(t *testing.T) {
 	}
 }
 
-// externalRecorder collects emitted events on a channel so a test can
+// eventRecorder collects emitted events on a channel so a test can
 // wait for exactly the events it expects instead of sleeping.
-func externalRecorder() (EmitFunc, chan string) {
+func eventRecorder() (EmitFunc, chan string) {
 	events := make(chan string, 64)
 	return func(run, src, typ string, payload map[string]interface{}) error {
 		events <- typ + ":" + payload["path"].(string)
@@ -1034,13 +1034,13 @@ func resolvedTempDir(t *testing.T) string {
 // A direct write to a watched policy file outside the repo is observed
 // and recorded with its absolute path; other files beside it, and the
 // config writer's own atomic temp file, are not reported.
-func TestWatchExternalFilesObservesOnlyTheListedFiles(t *testing.T) {
+func TestWatchTrustedFilesObservesOnlyTheListedFiles(t *testing.T) {
 	repo := initRepo(t)
 	home := resolvedTempDir(t)
 	dir := filepath.Join(home, ".centrol") // does not exist yet: the watcher creates it
 	files := []string{filepath.Join(dir, "enterprise-policy.json"), filepath.Join(dir, "allowlist.json"), filepath.Join(dir, "config.toml")}
 
-	emit, events := externalRecorder()
+	emit, events := eventRecorder()
 	ignore, err := LoadIgnore(repo)
 	if err != nil {
 		t.Fatal(err)
@@ -1050,8 +1050,8 @@ func TestWatchExternalFilesObservesOnlyTheListedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	if err := w.WatchExternalFiles(files); err != nil {
-		t.Fatalf("WatchExternalFiles: %v", err)
+	if err := w.WatchTrustedFiles(files); err != nil {
+		t.Fatalf("WatchTrustedFiles: %v", err)
 	}
 	go w.Run()
 
@@ -1091,11 +1091,11 @@ func TestWatchExternalFilesObservesOnlyTheListedFiles(t *testing.T) {
 
 // If the repo root is the home directory, ~/.centrol is also the repo's
 // own hard-excluded .centrol; the policy files must still be seen.
-func TestWatchExternalFilesWorksWhenTheRepoIsTheHomeDirectory(t *testing.T) {
+func TestWatchTrustedFilesWorksWhenTheRepoIsTheHomeDirectory(t *testing.T) {
 	home := resolvedTempDir(t)
 	file := filepath.Join(home, ".centrol", "allowlist.json")
 
-	emit, events := externalRecorder()
+	emit, events := eventRecorder()
 	ignore, err := LoadIgnore(home)
 	if err != nil {
 		t.Fatal(err)
@@ -1105,7 +1105,7 @@ func TestWatchExternalFilesWorksWhenTheRepoIsTheHomeDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	if err := w.WatchExternalFiles([]string{file}); err != nil {
+	if err := w.WatchTrustedFiles([]string{file}); err != nil {
 		t.Fatal(err)
 	}
 	go w.Run()
@@ -1128,16 +1128,82 @@ func TestWatchExternalFilesWorksWhenTheRepoIsTheHomeDirectory(t *testing.T) {
 	t.Fatalf("no event for %s with the repo root at the home directory", file)
 }
 
-func TestWatchExternalFilesWithNothingToWatchIsANoOp(t *testing.T) {
+func TestWatchTrustedFilesWithNothingToWatchIsANoOp(t *testing.T) {
 	repo := initRepo(t)
-	emit, _ := externalRecorder()
+	emit, _ := eventRecorder()
 	ignore, _ := LoadIgnore(repo)
 	w, err := NewWatcher(repo, "run-1", ignore, emit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	if err := w.WatchExternalFiles(nil); err != nil {
-		t.Fatalf("WatchExternalFiles(nil) = %v, want nil", err)
+	if err := w.WatchTrustedFiles(nil); err != nil {
+		t.Fatalf("WatchTrustedFiles(nil) = %v, want nil", err)
+	}
+}
+
+// The repo's config.toml sits inside the .centrol directory that the
+// recursive watch excludes because the ledger lives there. Watching the
+// config file must not re-include the ledger: segments, rotated
+// segments and anything else in the directory stay silent.
+func TestWatchTrustedFilesSeesTheRepoConfigButNotTheLedger(t *testing.T) {
+	repo := resolvedTempDir(t)
+	centrolDir := filepath.Join(repo, ".centrol")
+	if err := os.MkdirAll(filepath.Join(centrolDir, "snapshots"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(centrolDir, "config.toml")
+
+	emit, events := eventRecorder()
+	ignore, err := LoadIgnore(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(repo, "run-1", ignore, emit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	if err := w.WatchTrustedFiles([]string{config}); err != nil {
+		t.Fatal(err)
+	}
+	go w.Run()
+
+	for i := 0; i < 20; i++ { // the ledger writing to itself, as in a real run
+		for _, name := range []string{"lighthouse.jsonl", "lighthouse.001.jsonl"} {
+			f, err := os.OpenFile(filepath.Join(centrolDir, name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.WriteString(`{"seq":1}` + "\n")
+			f.Close()
+		}
+	}
+	if err := os.WriteFile(filepath.Join(centrolDir, "snapshots", "snap"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config, []byte("[general]\nobserve_mode = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "observed.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var sawConfig, sawRepoFile bool
+	for _, e := range drain(events, 300*time.Millisecond) {
+		switch {
+		case e == "fs.create:"+config || e == "fs.write:"+config:
+			sawConfig = true
+		case strings.Contains(e, "observed.go"):
+			sawRepoFile = true
+		default:
+			t.Errorf("unexpected event from the .centrol directory: %s", e)
+		}
+	}
+	if !sawConfig {
+		t.Error("no event for the repo config file")
+	}
+	if !sawRepoFile {
+		t.Error("the ordinary repo watch must keep working")
 	}
 }

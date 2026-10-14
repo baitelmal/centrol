@@ -1607,6 +1607,50 @@ func TestGuardRecordsADirectWriteToAPolicyFile(t *testing.T) {
 	}
 }
 
+// TestGuardRecordsADirectWriteToTheRepoConfig is the repo-config twin of
+// the home-file test: the file sits in the .centrol directory the repo
+// watch excludes, so it is watched individually. The same run proves the
+// ledger beside it is still excluded: no event names any ledger file.
+func TestGuardRecordsADirectWriteToTheRepoConfig(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(initTestRepo(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dir, ".centrol", "config.toml")
+
+	cmd := exec.Command(binPath, "guard", "--", "sh", "-c",
+		fmt.Sprintf("mkdir -p %s && printf '[general]\\nobserve_mode = true\\n' > %s && echo done > %s/notes.txt", filepath.Dir(target), target, dir))
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "HOME="+home, "USERPROFILE="+home)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("guard failed: %v\n%s", err, out)
+	}
+
+	ledgerData, err := os.ReadFile(filepath.Join(dir, ".centrol", "lighthouse.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := string(ledgerData)
+	if !strings.Contains(ledger, `"type":"policy.violation"`) || !strings.Contains(ledger, `"path":"`+target+`"`) {
+		t.Fatalf("expected a policy.violation naming %s, got ledger:\n%s", target, ledger)
+	}
+	if !strings.Contains(ledger, `"tier":"block"`) {
+		t.Fatalf("expected a block-tier violation, got ledger:\n%s", ledger)
+	}
+	if !strings.Contains(ledger, `"type":"fs.`) || !strings.Contains(ledger, `"path":"notes.txt"`) {
+		t.Fatalf("the ordinary repo watch must keep working, got ledger:\n%s", ledger)
+	}
+	for _, line := range strings.Split(ledger, "\n") {
+		if strings.Contains(line, `"type":"fs.`) && strings.Contains(line, "lighthouse") {
+			t.Fatalf("an event names a ledger file; the ledger must stay excluded: %s", line)
+		}
+	}
+}
+
 func TestProxyTargetFlagOverridesConfiguredTargetURL(t *testing.T) {
 	dir := initTestRepo(t)
 
