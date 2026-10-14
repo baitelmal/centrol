@@ -61,24 +61,6 @@ func (s *SessionContractSource) Set(key string, value interface{}) {
 	s.values[key] = value
 }
 
-// EnterpriseSource is a real stub, not a placeholder: it is instantiated
-// and takes part in the resolution chain like any other source, but
-// returns found=false for everything and is never writable. No network
-// calls are made. Swapping this for a real implementation later changes
-// nothing at any call site — every call site talks to the PolicySource
-// interface, never to this type.
-type EnterpriseSource struct{}
-
-func NewEnterpriseSource() *EnterpriseSource { return &EnterpriseSource{} }
-
-func (e *EnterpriseSource) Name() string { return SourceEnterprisePolicy }
-
-func (e *EnterpriseSource) Resolve(key string) (interface{}, bool, error) {
-	return nil, false, nil
-}
-
-func (e *EnterpriseSource) Writable() bool { return false }
-
 // LocalFileSource reads (and, if writable, writes) one centrol config
 // file in the [section] key = value subset of TOML this package
 // supports. Two instances exist in the normal chain: one for the repo

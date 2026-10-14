@@ -33,10 +33,10 @@ func cmdConfig(args []string) {
 // runConfigMenu is cmdConfig's actual logic, separated out so tests can
 // drive it against an arbitrary in/out and — critically — an arbitrary
 // *policy.Resolver, including one whose EnterpriseSource is swapped for
-// a synthetic test double that returns a real value. That is the only
-// way to exercise the "locked by enterprise" display path at all in
-// v0.1: the real EnterpriseSource always returns found=false, by
-// design (see internal/policy.EnterpriseSource).
+// a synthetic test double that answers an arbitrary key, so the
+// "locked by enterprise" display path can be exercised for keys the
+// real EnterpriseSource (which answers only proxy.allowed_servers)
+// does not.
 func runConfigMenu(in *bufio.Reader, out io.Writer, resolver *policy.Resolver) {
 	for {
 		fmt.Fprint(out, `

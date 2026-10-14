@@ -134,17 +134,6 @@ func TestLocalFileSourceWriteLeavesNoTempFileOnSuccess(t *testing.T) {
 	}
 }
 
-func TestEnterpriseSourceNeverFindsAnythingAndIsNotWritable(t *testing.T) {
-	e := NewEnterpriseSource()
-	_, found, err := e.Resolve("proxy.mass_mutation_threshold")
-	if err != nil || found {
-		t.Fatalf("expected the enterprise stub to never find anything, found=%v err=%v", found, err)
-	}
-	if e.Writable() {
-		t.Fatalf("expected the enterprise stub to never be writable")
-	}
-}
-
 // TestResolutionChainPriorityOrder is the core acceptance test for
 // section 3: session contract beats enterprise beats repo config beats
 // user config beats the built-in default, and every level's absence

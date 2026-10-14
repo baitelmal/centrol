@@ -119,7 +119,7 @@ func repoConfigPath(root string) string {
 
 // newResolver builds the standard v0.1 chain: session contract (empty —
 // nothing in the CLI sets per-run overrides yet, but the seam exists),
-// enterprise policy (a real stub, see internal/policy.EnterpriseSource),
+// enterprise policy (~/.centrol/enterprise-policy.json, see internal/policy.EnterpriseSource),
 // repo config, user config, then whatever built-in defaults the
 // specific Resolve* helper being called already knows.
 func newResolver(root string) *policy.Resolver {

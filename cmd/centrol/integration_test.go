@@ -780,11 +780,10 @@ func TestQuietAndVerboseFlagsNeverReachTheWrappedAgent(t *testing.T) {
 
 // fakeLockedSource is a PolicySource test double standing in for a real
 // enterprise policy client: unlike policy.EnterpriseSource (which
-// always returns found=false in v0.1, by design — see its doc
-// comment), this one actually answers one specific key, so the
-// "locked by enterprise" display path in `centrol config` — which no
-// real EnterpriseSource in this version ever exercises — has something
-// to prove itself against.
+// answers only proxy.allowed_servers), this one answers one specific
+// key of the test's choosing, so the "locked by enterprise" display
+// path in `centrol config` can be proven for keys the real source
+// does not answer.
 type fakeLockedSource struct {
 	key   string
 	value interface{}
@@ -845,6 +844,41 @@ func TestConfigMenuSyntheticLockedValueDisplaysAndCannotBeEdited(t *testing.T) {
 	repoData, _ := os.ReadFile(filepath.Join(dir, "repo-config.toml"))
 	if strings.Contains(string(repoData), "allow_session_amend") {
 		t.Fatalf("expected no write to repo config for a locked key, got:\n%s", repoData)
+	}
+}
+
+// TestConfigMenuLocksAllowlistFromEnterprisePolicyFile is the same
+// locked-menu check as above against the real EnterpriseSource reading
+// a policy file, rather than a test double: the allowlist it answers
+// must show as locked and must refuse an add.
+func TestConfigMenuLocksAllowlistFromEnterprisePolicyFile(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "enterprise-policy.json")
+	if err := os.WriteFile(policyPath, []byte(`{"servers":[{"server":"server-filesystem","tools":["read_file"]}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver := policy.NewResolver(
+		policy.NewSessionContractSource(),
+		policy.NewEnterpriseSourceAt(policyPath),
+		policy.NewLocalFileSource(policy.SourceRepoConfig, filepath.Join(dir, "repo-config.toml")),
+		policy.NewLocalFileSource(policy.SourceUserConfig, filepath.Join(dir, "user-config.toml")),
+		policy.NewDefaultSource(nil),
+	)
+
+	// Allowlist menu (1), try to add a server, back out, quit.
+	in := bufio.NewReader(strings.NewReader("1\n+\nb\nq\n"))
+	var out bytes.Buffer
+	runConfigMenu(in, &out, resolver)
+
+	got := out.String()
+	if !strings.Contains(got, "server-filesystem") || !strings.Contains(got, "locked by enterprise") {
+		t.Fatalf("expected the allowlist to list the policy's server as locked by enterprise, got:\n%s", got)
+	}
+	if !strings.Contains(got, "cannot be edited here") || strings.Contains(got, "Package or binary name to allow") {
+		t.Fatalf("expected the add to be refused, got:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "repo-config.toml")); err == nil {
+		t.Fatal("a locked allowlist must not write the repo config")
 	}
 }
 
