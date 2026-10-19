@@ -677,6 +677,18 @@ matures, narrower auto-approval is planned — not shipped:
 
 Only Tier 1 exists today. Tiers 2 and 3 are direction, not a promise.
 
+## Regulatory & Framework Alignment
+
+Centrol produces artifacts that support assessment against major AI governance, security, and compliance frameworks. It does not certify or fulfill any framework on its own — an organization demonstrates compliance, and the ledger supplies the evidence.
+
+| Framework | Requirement | What Centrol Contributes |
+| :--- | :--- | :--- |
+| **EU AI Act** | **Article 12 — Record-Keeping.** High-risk AI systems must technically allow automatic recording of events (logs) over the system's lifetime, sufficient to ensure traceability. | An append-only, hash-chained ledger written outside the agent's process. Entries are timestamped, sequenced, and linked, and `centrol audit --verify` confirms the chain is intact — so a record can be shown to be unaltered after the fact. |
+| **NIST AI RMF** | **MEASURE 2.8** — Risks associated with transparency and accountability are examined and documented.<br><br>**GOVERN 2.1** — Roles, responsibilities, and lines of communication for managing AI risks are documented and clear. | Pre-flight policy decisions and refusals are recorded as ledger entries, so both what ran and what was denied are documented. Each entry names the governing source (session contract, enterprise policy, repo config, user config, or default), which supports documenting who set the boundary and what it was. |
+| **NIST AI RMF** | **MAP 2.2** — Information is documented about the system's knowledge limits and how output will be utilized and overseen by humans. | The ledger records every governed action the agent takes, plus a snapshot boundary at the start and end of each run — giving a documented record of where human oversight began and ended. |
+| **OWASP Agentic Security** | **ASI02** — Tool Misuse and Exploitation. Agents may use permitted tools in harmful ways.<br><br>**ASI04** — Agentic Supply Chain Vulnerabilities. Compromised or manipulated tools, plugins, or MCP servers.<br><br>**ASI10** — Rogue Agents. Malicious or misaligned autonomous behavior. | The MCP proxy evaluates each tool call against allowlists before it is forwarded, and denies with a structured error the caller can parse. Every call — allowed or denied — is recorded. The record is produced outside the agent's process, so it remains intact even if the agent is compromised. |
+| **ISO/IEC 42001** | **Clause 8** — Operational Planning and Control.<br><br>**Clause 9.2** — Internal Audit. Live operational records and audit trails showing that AI management controls actually ran, not just that they were documented. | The ledger is an operational record, not a policy description — it is produced during runs, not written about them. `centrol-verify`, a standalone verifier that imports nothing from `centrol`, can re-derive the hash rule and check a ledger independently, which gives internal or external reviewers an artifact they can validate without trusting the binary that produced it. |
+
 ## Non-negotiables
 
 - No telemetry. No phone-home. No account required. Works fully offline.
