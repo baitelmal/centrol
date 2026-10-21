@@ -8,7 +8,7 @@ Centrol: The Independent Flight Recorder for AI Agents
  
 When you let an AI agent work on your machine — running commands, editing files, calling tools — the only record of what it did is usually the agent's own log. But if an agent goes off the rails, its own log is the one thing you can't trust, because the agent wrote it about itself.
 
-Centrol sits completely outside the agent. It writes an independent, tamper-evident record that the agent cannot touch or alter. When something goes wrong, you can see what actually happened and prove it — to a teammate, a reviewer, or anyone who wasn't watching — without asking anyone to take the agent's word for it. 
+Centrol sits completely outside the agent. It writes an independent, tamper-evident record that the agent cannot alter without detection. When something goes wrong, you can see what actually happened and prove it — to a teammate, a reviewer, or anyone who wasn't watching — without asking anyone to take the agent's word for it. 
 
 This gives you the management, insight, and visibility you're missing — through a truth ledger you can use to assess decisions, direction, stages, and deviations, and to build confidence and trust in your agents.
 
